@@ -1,5 +1,28 @@
 # Pairing handshake
 
+## 0. MVP bootstrap (implemented)
+
+Stable coordinator identity for LAN TOFU pairing:
+
+- Files under `%LOCALAPPDATA%\dllm\` (fallback: process working directory):
+  `node-identity.crt` + `node-identity.key` (raw DER bytes, minted via
+  `dllm-net Identity::generate`), plus `node-id.txt` (`dllm-<fp[..12]>`,
+  re-derived from the cert fingerprint if missing). Generated once with
+  `create_dir_all`; restart reuses the same bytes. Operator reads the
+  fingerprint from the `stable node identity loaded` INFO log.
+- `GET /api/node` -> `{"node_id","fingerprint","quic_port":8443,"version":"0.1.0"}`
+  (`fingerprint` = lowercase hex `sha256(cert_der)`).
+- `dllm id [--port 8080]` prints `node_id`, `fingerprint`, and one line:
+  `dllm://pair?host=<lan-ip>&port=<http>&quic=8443&fp=<fingerprint>&v=0.1.0`
+  (`<lan-ip>` = best-effort local IPv4, fallback `127.0.0.1`).
+  The Android app scans/types this URI, then pins `fp` for QUIC mTLS TOFU
+  (see `crates/dllm-net/src/transport.rs`).
+- mDNS `_dllm._tcp.local.` TXT currently advertises
+  `quic_port` / `node_id` / `ver` / `fp` (discovery only).
+
+Full invite-secret + verify-code flow below (§2–§5) is the target design;
+until it lands, the `fp` in this bootstrap URI is the pairing trust root.
+
 Goal: admit ≤5 trusted devices to the LAN mesh with per-device revocable
 mTLS credentials. No shared LAN password.
 

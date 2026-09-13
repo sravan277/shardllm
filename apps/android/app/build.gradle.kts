@@ -7,6 +7,7 @@ plugins {
 android {
     namespace = "com.dllm.mesh"
     compileSdk = 35
+    ndkVersion = "26.3.11579264"
 
     defaultConfig {
         applicationId = "com.dllm.mesh"
@@ -14,6 +15,22 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0-phase0"
+
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+        externalNativeBuild {
+            cmake {
+                arguments += listOf("-DANDROID_STL=c++_static", "-DANDROID_PLATFORM=android-28")
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildTypes {
@@ -60,6 +77,7 @@ dependencies {
     // EXTRA vs spec (required for NavHost two-route navigation):
     implementation("androidx.navigation:navigation-compose:2.7.7")
     implementation("androidx.core:core-ktx:1.13.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
     implementation("androidx.datastore:datastore-preferences:1.1.1")

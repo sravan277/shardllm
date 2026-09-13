@@ -40,6 +40,12 @@ enum Commands {
     },
     /// Show active sessions/plans (Phase 0 placeholder).
     Ps,
+    /// Print stable node_id + fingerprint + pairing URI (Android scan/type).
+    Id {
+        /// HTTP port baked into the pairing URI (must match `serve --port`).
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
 }
 
 #[tokio::main]
@@ -61,10 +67,23 @@ async fn main() -> anyhow::Result<()> {
             cmd_ps();
             Ok(())
         }
+        Commands::Id { port } => {
+            cmd_id(port)?;
+            Ok(())
+        }
     }
 }
 
 async fn run_serve(port: u16) -> anyhow::Result<()> {
+    // Stable node identity: load-or-generate persistent Quinn Identity.
+    let (_identity, node_id, fingerprint) = load_or_create_identity()?;
+    tracing::info!(%node_id, %fingerprint, "stable node identity loaded");
+    let node = dllm_serve::NodeInfo {
+        node_id: node_id.clone(),
+        fingerprint: fingerprint.clone(),
+        quic_port: dllm_serve::QUIC_PORT,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
     let store = Arc::new(dllm_store::Store::open("dllm-events.db")?);
     // Prefer real inference when weights are present; the server must never
     // fail to start for lack of weights, so fall back to MockEngine.
@@ -84,13 +103,20 @@ async fn run_serve(port: u16) -> anyhow::Result<()> {
             Arc::new(dllm_core::MockEngine::new())
         }
     };
-    let state = dllm_serve::new_state(engine, store);
+    let state = dllm_serve::new_state_with_node(engine, store, node);
     let app = dllm_serve::router(state);
 
     // mDNS advertise `_dllm._tcp.local.` (discovery only; no inference here).
     let daemon = mdns_sd::ServiceDaemon::new()?;
     let instance = format!("dllm-node-{port}");
-    let txt: &[(&str, &str)] = &[("quic_port", "0"), ("node_id", "dllm-dev-1"), ("ver", "0.1.0")];
+    let quic_port = dllm_serve::QUIC_PORT.to_string();
+    let version = env!("CARGO_PKG_VERSION");
+    let txt: &[(&str, &str)] = &[
+        ("quic_port", &quic_port),
+        ("node_id", &node_id),
+        ("ver", version),
+        ("fp", &fingerprint),
+    ];
     let svc = mdns_sd::ServiceInfo::new(
         "_dllm._tcp.local.",
         &instance,
@@ -139,6 +165,90 @@ fn model_dir() -> PathBuf {
     } else {
         PathBuf::from("models")
     }
+}
+
+/// Stable node state lives next to the weights: `%LOCALAPPDATA%\dllm\`
+/// (else the process working directory), mirroring [`model_dir`].
+fn node_dir() -> PathBuf {
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        PathBuf::from(local).join("dllm")
+    } else {
+        PathBuf::from(".")
+    }
+}
+
+/// Load-or-generate the persistent Quinn [`dllm_net::transport::Identity`].
+///
+/// DER bytes live at `node-identity.crt` / `node-identity.key` under
+/// [`node_dir`]; `node-id.txt` next to them holds the stable `node_id`
+/// (derived from the fingerprint on first run). Returns
+/// `(identity, node_id, fingerprint)`.
+fn load_or_create_identity(
+) -> anyhow::Result<(dllm_net::transport::Identity, String, String)> {
+    use dllm_net::transport::Identity;
+
+    let dir = node_dir();
+    std::fs::create_dir_all(&dir)?;
+    let cert_path = dir.join("node-identity.crt");
+    let key_path = dir.join("node-identity.key");
+    let id_path = dir.join("node-id.txt");
+
+    let identity = match (std::fs::read(&cert_path), std::fs::read(&key_path)) {
+        (Ok(cert_der), Ok(key_der)) if !cert_der.is_empty() && !key_der.is_empty() => {
+            Identity::from_der(cert_der, key_der)
+        }
+        _ => {
+            let fresh = Identity::generate().map_err(|e| anyhow::anyhow!("{e:#}"))?;
+            std::fs::write(&cert_path, &fresh.cert_der)?;
+            std::fs::write(&key_path, &fresh.key_der)?;
+            fresh
+        }
+    };
+    let fingerprint = identity.fingerprint();
+
+    let node_id = match std::fs::read_to_string(&id_path) {
+        Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => {
+            let derived = format!("dllm-{}", &fingerprint[..12.min(fingerprint.len())]);
+            // Best-effort persist; a missing file just re-derives the same id.
+            let _ = std::fs::write(&id_path, format!("{derived}\n"));
+            derived
+        }
+    };
+    Ok((identity, node_id, fingerprint))
+}
+
+/// Best-effort local IPv4 for the pairing URI (outbound-route trick).
+/// Falls back to `127.0.0.1` when offline or on error.
+fn lan_ipv4() -> String {
+    (|| -> anyhow::Result<String> {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        sock.connect("8.8.8.8:80")?;
+        let ip = sock.local_addr()?.ip();
+        match ip {
+            std::net::IpAddr::V4(v4) if !v4.is_unspecified() => Ok(v4.to_string()),
+            _ => anyhow::bail!("no ipv4 route"),
+        }
+    })()
+    .unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+fn pairing_uri(host: &str, port: u16, fingerprint: &str) -> String {
+    format!(
+        "dllm://pair?host={host}&port={port}&quic={}&fp={fingerprint}&v={}",
+        dllm_serve::QUIC_PORT,
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn cmd_id(port: u16) -> anyhow::Result<()> {
+    let (_identity, node_id, fingerprint) = load_or_create_identity()?;
+    let host = lan_ipv4();
+    let uri = pairing_uri(&host, port, &fingerprint);
+    println!("node_id: {node_id}");
+    println!("fingerprint: {fingerprint}");
+    println!("{uri}");
+    Ok(())
 }
 
 fn model_file(m: &serde_json::Value) -> Option<(PathBuf, String, u64, String)> {

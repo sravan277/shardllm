@@ -20,5 +20,6 @@ axum = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 dllm-core = { path = "../../crates/dllm-core" }
+dllm-net = { path = "../../crates/dllm-net" }
 dllm-store = { path = "../../crates/dllm-store" }
 dllm-serve = { path = "../../crates/dllm-serve" }

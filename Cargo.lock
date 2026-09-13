@@ -538,6 +538,7 @@ dependencies = [
  "axum",
  "clap",
  "dllm-core",
+ "dllm-net",
  "dllm-serve",
  "dllm-store",
  "mdns-sd",

@@ -28,6 +28,18 @@ sealed interface ChatEvent {
 }
 
 /**
+ * Server identity from GET /api/node ->
+ * {"node_id","fingerprint","quic_port","version"}.
+ * Optional enhancement: older servers may 404; callers must handle that.
+ */
+data class NodeInfo(
+    val nodeId: String,
+    val fingerprint: String,
+    val quicPort: Int?,
+    val version: String,
+)
+
+/**
  * OkHttp SSE client (Phase 0 transport; QUIC/TCP-binary lands behind this
  * same shape in Phase 3 per research).
  *
@@ -133,5 +145,37 @@ class SseClient(
                     text.trim()
                 }.ifBlank { throw IOException("Empty session id from $url") }
             }
+        }
+
+    /** GET {base}/api/health — returns HTTP status; throws on transport error. */
+    suspend fun getHealth(baseUrl: String): Int =
+        withContext(Dispatchers.IO) {
+            val url = "${baseUrl.trimEnd('/')}/api/health"
+            val req = Request.Builder().url(url).get().build()
+            callClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) throw IOException("GET $url -> HTTP ${resp.code}")
+                resp.code
+            }
+        }
+
+    /**
+     * GET {base}/api/node -> [NodeInfo]. Throws on transport error or HTTP
+     * error (callers treat 404 as "server too old, node info unavailable").
+     */
+    suspend fun getNodeInfo(baseUrl: String): NodeInfo =
+        withContext(Dispatchers.IO) {
+            val url = "${baseUrl.trimEnd('/')}/api/node"
+            val req = Request.Builder().url(url).get().build()
+            val text = callClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) throw IOException("GET $url -> HTTP ${resp.code}")
+                resp.body?.string().orEmpty()
+            }
+            val obj = JSONObject(text)
+            NodeInfo(
+                nodeId = obj.optString("node_id"),
+                fingerprint = obj.optString("fingerprint"),
+                quicPort = obj.optInt("quic_port", -1).takeIf { it >= 0 },
+                version = obj.optString("version"),
+            )
         }
 }

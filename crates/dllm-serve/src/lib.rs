@@ -3,6 +3,7 @@
 //! Routes:
 //! - `GET /api/health`
 //! - `GET /api/models` (baked catalog JSON)
+//! - `GET /api/node` (stable node_id + fingerprint + quic_port, pairing bootstrap)
 //! - `POST /v1/sessions`
 //! - `POST /v1/sessions/{id}/messages` (spawns mock generation)
 //! - `GET /v1/sessions/{id}/events` (SSE, keep-alive 15 s)
@@ -51,12 +52,50 @@ pub struct AppState {
     pub engine: Arc<dyn Engine>,
     pub store: Arc<Store>,
     pub tx: broadcast::Sender<SseMsg>,
+    pub node: NodeInfo,
 }
+
+/// Stable node identity surfaced via `GET /api/node` (pairing bootstrap).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeInfo {
+    pub node_id: String,
+    pub fingerprint: String,
+    pub quic_port: u16,
+    pub version: String,
+}
+
+impl Default for NodeInfo {
+    fn default() -> Self {
+        Self {
+            node_id: "dllm-dev-1".to_string(),
+            fingerprint: "unknown".to_string(),
+            quic_port: QUIC_PORT,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
+/// QUIC transport port advertised for pairing (TOFU mTLS).
+pub const QUIC_PORT: u16 = 8443;
 
 /// Build shared state with a 256-slot broadcast channel.
 pub fn new_state(engine: Arc<dyn Engine>, store: Arc<Store>) -> Arc<AppState> {
+    new_state_with_node(engine, store, NodeInfo::default())
+}
+
+/// Build shared state with explicit node identity (preferred by `dllm serve`).
+pub fn new_state_with_node(
+    engine: Arc<dyn Engine>,
+    store: Arc<Store>,
+    node: NodeInfo,
+) -> Arc<AppState> {
     let (tx, _rx) = broadcast::channel(256);
-    Arc::new(AppState { engine, store, tx })
+    Arc::new(AppState {
+        engine,
+        store,
+        tx,
+        node,
+    })
 }
 
 /// Build the Axum router. Takes `Arc<AppState>` for `with_state`.
@@ -64,6 +103,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/models", get(models))
+        .route("/api/node", get(node_info))
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/{id}/messages", post(post_message))
         .route("/v1/sessions/{id}/events", get(session_events))
@@ -87,6 +127,10 @@ async fn models() -> impl IntoResponse {
         [("content-type", "application/json")],
         CATALOG_JSON,
     )
+}
+
+async fn node_info(State(state): State<Arc<AppState>>) -> Json<NodeInfo> {
+    Json(state.node.clone())
 }
 
 #[derive(Debug, Default, Deserialize)]

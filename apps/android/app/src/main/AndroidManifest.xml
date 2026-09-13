@@ -15,10 +15,11 @@
         android:name="android.hardware.camera"
         android:required="false" />
 
+    <!-- true: default/LAN servers are plain http (dev); TLS pinning lands with pairing crypto. -->
     <application
         android:label="DLLM Mesh"
         android:theme="@style/Theme.DllmMesh"
-        android:usesCleartextTraffic="false"
+        android:usesCleartextTraffic="true"
         android:allowBackup="false">
 
         <activity

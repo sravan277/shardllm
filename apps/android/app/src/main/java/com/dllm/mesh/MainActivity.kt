@@ -7,6 +7,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -24,6 +26,8 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.dllm.mesh.ui.ChatScreen
 import com.dllm.mesh.ui.DevicesScreen
+import com.dllm.mesh.ui.PairingScreen
+import com.dllm.mesh.ui.SettingsScreen
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -83,6 +87,26 @@ fun DllmMeshApp() {
                     icon = { Icon(Icons.Filled.List, contentDescription = null) },
                     label = { Text("Devices") },
                 )
+                NavigationBarItem(
+                    selected = route == "pairing",
+                    onClick = {
+                        if (route != "pairing") {
+                            navController.navigate("pairing") { launchSingleTop = true }
+                        }
+                    },
+                    icon = { Icon(Icons.Filled.QrCodeScanner, contentDescription = null) },
+                    label = { Text("Pairing") },
+                )
+                NavigationBarItem(
+                    selected = route == "settings",
+                    onClick = {
+                        if (route != "settings") {
+                            navController.navigate("settings") { launchSingleTop = true }
+                        }
+                    },
+                    icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
+                    label = { Text("Settings") },
+                )
             }
         },
     ) { padding ->
@@ -93,6 +117,8 @@ fun DllmMeshApp() {
         ) {
             composable("chat") { ChatScreen() }
             composable("devices") { DevicesScreen() }
+            composable("pairing") { PairingScreen() }
+            composable("settings") { SettingsScreen() }
         }
     }
 }
