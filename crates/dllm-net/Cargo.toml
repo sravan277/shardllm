@@ -1,0 +1,15 @@
+[package]
+name = "dllm-net"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }

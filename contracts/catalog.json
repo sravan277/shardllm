@@ -1,0 +1,139 @@
+{
+  "catalog_version": 1,
+  "wire_dim": 1024,
+  "kv_budgets_note": "Per-shard KV @4096 tokens, FP16. bytes/token/shard-layer = 4096. Q8 KV halves these.",
+  "models": [
+    {
+      "id": "qwen3-0.6b-q4",
+      "display_name": "Qwen3 0.6B (Q4_K_M)",
+      "arch": "qwen3",
+      "num_layers": 28,
+      "hidden_size": 1024,
+      "num_attention_heads": 16,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "vocab_size": 151936,
+      "quantization": "Q4_K_M",
+      "context_default": 32768,
+      "compatible_runtime": "0.1.0",
+      "source": {
+        "publisher": "unsloth",
+        "repo": "unsloth/Qwen3-0.6B-GGUF",
+        "file": "Qwen3-0.6B-Q4_K_M.gguf",
+        "url": "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
+        "sha256": "TODO-SHA256",
+        "bytes": 416354304
+      },
+      "files": [
+        {
+          "role": "shared-tensors",
+          "sha256": "TODO-SHA256",
+          "bytes": 167772160,
+          "url": "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
+          "note": "embed (tied, Q8_0/F16) + output_norm + metadata; byte-range of source until splitter ships standalone shards"
+        },
+        {
+          "role": "layer-shard",
+          "layer_start": 0,
+          "layer_end": 8,
+          "sha256": "TODO-SHA256",
+          "bytes": 83886080,
+          "url": "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf"
+        },
+        {
+          "role": "layer-shard",
+          "layer_start": 9,
+          "layer_end": 18,
+          "sha256": "TODO-SHA256",
+          "bytes": 93113530,
+          "url": "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf"
+        },
+        {
+          "role": "layer-shard",
+          "layer_start": 19,
+          "layer_end": 27,
+          "sha256": "TODO-SHA256",
+          "bytes": 83886080,
+          "url": "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf"
+        }
+      ],
+      "default_plan": {
+        "stages": [
+          { "stage": 0, "layer_start": 0, "layer_end": 8, "layers": 9, "kv_budget_mib_4k_fp16": 144 },
+          { "stage": 1, "layer_start": 9, "layer_end": 18, "layers": 10, "kv_budget_mib_4k_fp16": 160 },
+          { "stage": 2, "layer_start": 19, "layer_end": 27, "layers": 9, "kv_budget_mib_4k_fp16": 144 }
+        ]
+      },
+      "sampling": {
+        "thinking": { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5 },
+        "non_thinking": { "temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5 }
+      }
+    },
+    {
+      "id": "qwen3-0.6b-q8",
+      "display_name": "Qwen3 0.6B (Q8_0)",
+      "arch": "qwen3",
+      "num_layers": 28,
+      "hidden_size": 1024,
+      "num_attention_heads": 16,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "vocab_size": 151936,
+      "quantization": "Q8_0",
+      "context_default": 32768,
+      "compatible_runtime": "0.1.0",
+      "source": {
+        "publisher": "official",
+        "repo": "Qwen/Qwen3-0.6B-GGUF",
+        "file": "Qwen3-0.6B-Q8_0.gguf",
+        "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
+        "sha256": "TODO-SHA256",
+        "bytes": 670040064
+      },
+      "files": [
+        {
+          "role": "shared-tensors",
+          "sha256": "TODO-SHA256",
+          "bytes": 167772160,
+          "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
+          "note": "embed (tied) + output_norm + metadata; byte-range of source until splitter ships standalone shards"
+        },
+        {
+          "role": "layer-shard",
+          "layer_start": 0,
+          "layer_end": 8,
+          "sha256": "TODO-SHA256",
+          "bytes": 134217728,
+          "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"
+        },
+        {
+          "role": "layer-shard",
+          "layer_start": 9,
+          "layer_end": 18,
+          "sha256": "TODO-SHA256",
+          "bytes": 149317222,
+          "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"
+        },
+        {
+          "role": "layer-shard",
+          "layer_start": 19,
+          "layer_end": 27,
+          "sha256": "TODO-SHA256",
+          "bytes": 134217728,
+          "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"
+        }
+      ],
+      "default_plan": {
+        "stages": [
+          { "stage": 0, "layer_start": 0, "layer_end": 8, "layers": 9, "kv_budget_mib_4k_fp16": 144 },
+          { "stage": 1, "layer_start": 9, "layer_end": 18, "layers": 10, "kv_budget_mib_4k_fp16": 160 },
+          { "stage": 2, "layer_start": 19, "layer_end": 27, "layers": 9, "kv_budget_mib_4k_fp16": 144 }
+        ]
+      },
+      "sampling": {
+        "thinking": { "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5 },
+        "non_thinking": { "temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5 }
+      }
+    }
+  ]
+}

@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dllm.local/schemas/model-manifest-v1.json",
+  "title": "model-manifest.json v1",
+  "description": "Signed manifest for one GGUF model: arch, shard map, hashes, tokenizer, sampling, runtime compat.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifest_version",
+    "model",
+    "arch",
+    "num_layers",
+    "hidden_size",
+    "num_attention_heads",
+    "num_kv_heads",
+    "head_dim",
+    "vocab_size",
+    "context_default",
+    "quantization",
+    "files",
+    "tokenizer",
+    "sampling",
+    "compatible_runtime"
+  ],
+  "properties": {
+    "manifest_version": { "const": 1 },
+    "model": {
+      "type": "string",
+      "description": "Catalog id, e.g. qwen3-0.6b-q4.",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "arch": { "const": "qwen3" },
+    "num_layers": { "type": "integer", "const": 28 },
+    "hidden_size": { "type": "integer", "const": 1024 },
+    "num_attention_heads": { "type": "integer", "const": 16 },
+    "num_kv_heads": { "type": "integer", "const": 8 },
+    "head_dim": { "type": "integer", "const": 128 },
+    "vocab_size": { "type": "integer", "const": 151936 },
+    "tie_word_embeddings": { "type": "boolean", "default": true },
+    "context_default": {
+      "type": "integer",
+      "default": 32768,
+      "description": "Default context length. Native 32768; config max 40960."
+    },
+    "quantization": {
+      "type": "string",
+      "enum": ["Q4_K_M", "Q8_0", "F16", "BF16"]
+    },
+    "files": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "sha256", "bytes", "url"],
+        "properties": {
+          "role": { "enum": ["shared-tensors", "layer-shard"] },
+          "layer_start": { "type": "integer", "minimum": 0, "maximum": 27 },
+          "layer_end": { "type": "integer", "minimum": 0, "maximum": 27 },
+          "sha256": {
+            "type": "string",
+            "pattern": "^([0-9a-fA-F]{64}|TODO-SHA256)$"
+          },
+          "bytes": { "type": "integer", "minimum": 1 },
+          "url": { "type": "string", "format": "uri" }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "role": { "const": "layer-shard" } } },
+            "then": { "required": ["layer_start", "layer_end"] }
+          },
+          {
+            "if": { "properties": { "role": { "const": "shared-tensors" } } },
+            "then": {
+              "not": { "anyOf": [{ "required": ["layer_start"] }, { "required": ["layer_end"] }] }
+            }
+          }
+        ]
+      }
+    },
+    "tokenizer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class", "vocab_size", "chat_template"],
+      "properties": {
+        "class": { "const": "Qwen2Tokenizer" },
+        "vocab_size": { "const": 151936 },
+        "chat_template": { "const": "qwen3-jinja" },
+        "bos_token": { "type": "string", "default": "<|im_start|>" },
+        "eos_token": { "type": "string", "default": "<|im_end|>" }
+      }
+    },
+    "sampling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["thinking", "non_thinking"],
+      "properties": {
+        "thinking": { "$ref": "#/$defs/sampling_preset" },
+        "non_thinking": { "$ref": "#/$defs/sampling_preset" }
+      }
+    },
+    "compatible_runtime": {
+      "type": "string",
+      "description": "Minimum dllm runtime, semver. Implies llama.cpp >= b5092 (first qwen3 arch support).",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    }
+  },
+  "$defs": {
+    "sampling_preset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["temperature", "top_p", "top_k", "min_p", "presence_penalty"],
+      "properties": {
+        "temperature": { "type": "number", "exclusiveMinimum": 0, "maximum": 2 },
+        "top_p": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "top_k": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "min_p": { "type": "number", "minimum": 0, "maximum": 1 },
+        "presence_penalty": { "type": "number", "minimum": 0, "maximum": 2 }
+      }
+    }
+  }
+}

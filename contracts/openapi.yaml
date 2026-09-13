@@ -1,0 +1,230 @@
+openapi: 3.0.3
+info:
+  title: DLLM LAN API
+  version: 0.1.0
+  description: Coordinator LAN API. All inference stays on-LAN. SSE resume via Last-Event-ID.
+servers:
+  - url: https://192.168.1.10:8443
+    description: Coordinator (mDNS _dllm._tcp.local.)
+paths:
+  /api/health:
+    get:
+      operationId: health
+      summary: Liveness + version
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /api/models:
+    get:
+      operationId: listModels
+      summary: Catalog + installed state
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [models]
+                properties:
+                  models:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ModelState'
+  /v1/sessions:
+    post:
+      operationId: createSession
+      summary: Create session (auto-pull if missing)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model]
+              properties:
+                model:
+                  type: string
+                  example: qwen3-0.6b-q4
+                prefill_chunk:
+                  type: integer
+                  minimum: 64
+                  maximum: 1024
+                  default: 256
+                thinking:
+                  type: boolean
+                  default: true
+      responses:
+        '200':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+  /v1/sessions/{id}/events:
+    get:
+      operationId: sessionEvents
+      summary: SSE stream (token/commit/status/keep-alive). Resume with Last-Event-ID.
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/LastEventId'
+      responses:
+        '200':
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: "event: token\ndata: {\"pos\":12,\"token\":1234}\n\n"
+  /v1/sessions/{id}/messages:
+    post:
+      operationId: postMessage
+      summary: Append user message, triggers prefill+decode
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+                  example: Explain KV paging in one line.
+      responses:
+        '202':
+          description: accepted, tokens arrive on SSE
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pos_start:
+                    type: integer
+  /v1/devices:
+    get:
+      operationId: listDevices
+      summary: Paired devices + capabilities
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  devices:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Device'
+  /v1/devices/{id}/approve:
+    post:
+      operationId: approveDevice
+      summary: Approve pending joiner (post verify-code)
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+      responses:
+        '200':
+          description: approved
+  /v1/devices/{id}/revoke:
+    post:
+      operationId: revokeDevice
+      summary: Revoke + push deny-list to workers
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+      responses:
+        '200':
+          description: revoked
+  /v1/plan:
+    get:
+      operationId: activePlan
+      summary: Active pipeline plan + per-stage latency
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Plan'
+components:
+  parameters:
+    SessionId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    DeviceId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    LastEventId:
+      name: Last-Event-ID
+      in: header
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+  schemas:
+    Health:
+      type: object
+      required: [ok, version, proto]
+      properties:
+        ok: { type: boolean }
+        version: { type: string, example: 0.1.0 }
+        proto: { type: string, example: dllm1 }
+    ModelState:
+      type: object
+      required: [id, state]
+      properties:
+        id: { type: string, example: qwen3-0.6b-q4 }
+        state:
+          type: string
+          enum: [missing, fetching, verifying, ready, serving]
+        progress: { type: number, minimum: 0, maximum: 1 }
+    Session:
+      type: object
+      required: [session_id, plan_id, model]
+      properties:
+        session_id: { type: string, format: uuid }
+        plan_id: { type: integer }
+        model: { type: string }
+    Device:
+      type: object
+      required: [device_id, role]
+      properties:
+        device_id: { type: string }
+        role: { type: string, enum: [coordinator, worker, client] }
+        permissions:
+          type: array
+          items: { type: string }
+        capabilities:
+          type: object
+          properties:
+            ms_per_layer_decode: { type: number }
+            kv_pages: { type: integer }
+    Plan:
+      type: object
+      required: [plan_id, stages]
+      properties:
+        plan_id: { type: integer }
+        stages:
+          type: array
+          items:
+            type: object
+            required: [stage, device_id, layer_start, layer_end, latency_ms]
+            properties:
+              stage: { type: integer }
+              device_id: { type: string }
+              layer_start: { type: integer }
+              layer_end: { type: integer }
+              latency_ms: { type: number }
+        bottleneck: { type: integer }
