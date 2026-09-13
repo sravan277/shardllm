@@ -1,6 +1,6 @@
 # Build Status (LIVING — update on every artifact change)
 
-> Last updated: Phase 1 pull/list/run landed; engine swap + bench IN PROGRESS (2026-09-13).
+> Last updated: Phase 1 pull/list/run landed; bench DONE (16.6 tok/s mean); engine swap IN PROGRESS (2026-09-13).
 
 | Artifact | Path | Status | Blocker / next |
 |----------|------|--------|----------------|
@@ -16,7 +16,7 @@
 | `dllm run` | `apps/dllm/src/main.rs` (`cmd_run`) | DONE | pull-if-missing + serve |
 | Model weights | `%LOCALAPPDATA%\dllm\models\` | PLANNED Phase 1 | unsloth Q4_K_M 397 MB |
 | Engine swap (llama-cpp-2) | `apps/dllm` | IN PROGRESS (sibling agent) | CPU-only `=0.1.156` |
-| Bench | — | IN PROGRESS (sibling agent) | — |
+| Bench | `crates/dllm-core/examples/bench_local.rs` + `docs/bench-baseline.json` | DONE (mean decode 16.6 tok/s, Qwen3-0.6B Q4_K_M, n_ctx 4096) | — |
 | Research | `docs/research/` (6 files) | DONE | — |
 | Master plan | `docs/MASTER_PLAN.md` | DONE | deltas logged in research/00-index |
 

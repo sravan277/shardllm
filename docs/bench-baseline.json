@@ -1,0 +1,31 @@
+{
+  "date": "2026-09-13",
+  "machine": "Windows 10, CPU MinGW",
+  "mean_decode_tps": 16.6,
+  "model": "Qwen3-0.6B",
+  "n_ctx": 4096,
+  "per_prompt": [
+    {
+      "decode_tps": 16.8,
+      "prompt_id": "short_chat",
+      "tokens": 19,
+      "total_s": 1.6,
+      "ttft_ms": 524.4
+    },
+    {
+      "decode_tps": 16.8,
+      "prompt_id": "para_completion",
+      "tokens": 74,
+      "total_s": 5.25,
+      "ttft_ms": 903.5
+    },
+    {
+      "decode_tps": 16.2,
+      "prompt_id": "no_think",
+      "tokens": 56,
+      "total_s": 3.87,
+      "ttft_ms": 489.6
+    }
+  ],
+  "quant": "Q4_K_M"
+}
