@@ -71,3 +71,33 @@ data: {"state":"serving","plan_id":7,"bottleneck":1}
 - Hard cap job (hourly): delete closed-session rows older than 24 h and
   orphaned `fetching` sessions older than 10 days (matches cloud backup TTL).
 - `VACUUM` never auto-runs; checkpoint via `PRAGMA wal_checkpoint(PASSIVE)` on close.
+
+### MVP retention policy (Phase 0 — implemented)
+
+The Phase 0 store (`crates/dllm-store`, `dllm-serve::spawn_maintenance`)
+implements this simpler policy; where it differs from the target design
+above, it is the operative contract until per-session close tracking lands:
+
+- `Store::prune_older_than(cutoff_ts: i64) -> Result<usize, StoreError>`
+  hard-deletes every event whose `ts` is older than `cutoff_ts` (Unix
+  milliseconds). Age-based across ALL sessions — live and closed sessions
+  are not distinguished yet (deviation from the closed-session design).
+- `ts` is the fixed-width ISO-8601 UTC text of the column default; the
+  cutoff is rendered into that exact format by SQLite (second precision),
+  so the comparison is a plain string compare.
+- The append-only `events_no_delete` trigger is dropped and re-created
+  inside the prune's single `BEGIN IMMEDIATE` transaction. Deletes stay
+  forbidden to every other caller, and a crash mid-prune rolls back
+  atomically (WAL + transactional DDL).
+- `dllm-serve::spawn_maintenance(store, ttl_secs)` runs the loop: every 60 s
+  (`MAINTENANCE_INTERVAL_SECS`, first tick fires immediately) it prunes
+  events older than `now - TTL` and immediately runs `Store::checkpoint()`
+  (`PRAGMA wal_checkpoint(TRUNCATE)`) to shrink the `-wal` file to zero
+  bytes — superseding the PASSIVE-on-close rule while the loop is active.
+- TTL default: 24 h (`dllm_serve::DEFAULT_EVENT_TTL_SECS = 86400`); override
+  with the `DLLM_EVENT_TTL_SECS` env var (integer seconds), which wins over
+  the `ttl_secs` parameter.
+- Wiring: `spawn_maintenance` is exported (not auto-spawned); the server
+  startup path (`dllm serve`) should call it once inside the Tokio runtime.
+- `GET /api/stats` surfaces log size for observability: `sessions`
+  (`COUNT(DISTINCT session)`) and `events` (`COUNT(*)`).

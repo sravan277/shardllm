@@ -1,5 +1,15 @@
 # Changelog (newest first — append on every change)
 
+## 2026-09-13 — Phase 5 hardening: store TTL/checkpoint, /api/stats, real JNI decode, acceptance harness
+
+- Store retention: `Store::prune_older_than` + `Store::checkpoint` (`PRAGMA wal_checkpoint(TRUNCATE)`) in `crates/dllm-store/src/lib.rs`; tests: WAL recovery replays all events after reopen, backdated prune restores append-only ordering.
+- Retention wired into the server: `dllm_serve::spawn_maintenance` now spawned from `run_serve` (`apps/dllm/src/main.rs`) — 60 s cadence, prune older than TTL then WAL-truncate checkpoint. Default TTL 24 h (`DEFAULT_EVENT_TTL_SECS`), `DLLM_EVENT_TTL_SECS` env override (ADR-023).
+- `/api/stats` telemetry surface (ADR-024): `uptime_s` / `engine` (llama|mock) / `sessions` / `events` / `node_id` in `crates/dllm-serve/src/lib.rs`.
+- Android JNI real decode, build-verified: `LlamaBridge.loadModel/inferChunk/free` (`apps/android/app/src/main/cpp/worker.cpp`) locked as the stable 3-symbol worker ABI over the bundled real llama.cpp `.so` (ADR-025); sampler chain per catalog in `LlamaEngine` (`crates/dllm-core/src/engine.rs`). On-device runtime verification stays PLANNED (human-gated).
+- Activation-frame roundtrip tests: `crates/dllm-serve/tests/frame_roundtrip.rs` (frame v1 across payload sizes).
+- MVP acceptance harness: `scripts/mvp-acceptance.ps1` (PS 5.1, no admin, curl.exe only) — artifacts (exe / APK / bench baseline), live `dllm serve --port 8099` E2E (health → node fingerprint → models → stats → session → message via `curl --data-binary @tmpfile` → SSE token events, llama-or-mock accepted), pipe_pair `PIPE_PAIR PASS`, PASS/FAIL checklist, exits 1 on any FAIL.
+- Docs: ADR-023/024/025; `BUILD_STATUS.md` Phase 5 rows (store TTL/checkpoint, `/api/stats`, real JNI decode build-verified, acceptance harness DONE; 2-device pipeline + on-device runtime verification PLANNED-human-gated); `CONNECTIONS.md` E7 maintenance edge + 8099 drill port.
+
 ## 2026-09-13 — Phase 3 headless pipe_pair drill (transport+planner+commit)
 
 - Added `crates/dllm-core/examples/pipe_pair.rs` (zero manifest edits): 2 identities with swapped fingerprints, worker `server()` on 127.0.0.1:8443, coordinator `connect()` strict; `plan_layers(28, [16.6 tok/s local, remote])` → 2 stages over Control stream → worker Ack; 8 `ActivationFrame`s over Activation via `frame_channel`/`spawn_frame_recv_loop` with `KvTentative` per frame; piggyback `on_commit(7)`, `on_truncate(6)` + resend 6,7 as new tokens, re-commit to `committed_pos=Some(7)`; worker saw truncate. Prints `PIPE_PAIR PASS stages=2 layers=28 frames=10 resends=2 committed_pos=7`.

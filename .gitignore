@@ -11,6 +11,7 @@ apps/android/.gradle/
 apps/android/build/
 apps/android/app/build/
 apps/android/app/.cxx/
+apps/android/app/src/main/cpp/third_party/
 apps/android/local.properties
 *.apk
 *.aab

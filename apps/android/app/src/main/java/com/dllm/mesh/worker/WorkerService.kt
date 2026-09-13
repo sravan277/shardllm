@@ -175,21 +175,21 @@ class WorkerService : Service() {
             startForegroundWith("DLLM Mesh worker — model unreadable")
             return
         }
-        // Single-threaded JNI sanity round-trip (stub decode until Phase 5).
+        // Single-threaded JNI sanity round-trip (real llama.cpp decode, Phase 5).
         val sanity = runCatching { LlamaBridge.inferChunk("ping", 4) }.getOrNull()
         updateStats {
             it.copy(
                 modelLoaded = true, modelPath = gguf.absolutePath, ready = true,
-                status = "Ready — ${gguf.name} staged (stub decode: $sanity)",
+                status = "Ready — ${gguf.name} (sanity decode: $sanity)",
                 lastHeartbeatEpochMs = System.currentTimeMillis(),
             )
         }
-        startForegroundWith("DLLM Mesh worker — ready (${gguf.name}, stub)")
+        startForegroundWith("DLLM Mesh worker — ready (${gguf.name})")
     }
 
-    // ---- compute stub ------------------------------------------------------
+    // ---- compute -----------------------------------------------------------
 
-    /** Phase 5: real JNI shard forward. WakeLock held ONLY around compute. */
+    /** Real JNI llama.cpp forward (Phase 5). WakeLock held ONLY around compute. */
     @Suppress("unused")
     private fun runShardCompute(prompt: String, maxTokens: Int): String {
         val power = getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -204,7 +204,9 @@ class WorkerService : Service() {
             } else {
                 ""
             }
-            // Stub counting until Phase 5 reports real decoded-token counts.
+            // Decoded-token count is still estimated as maxTokens; inferChunk
+            // returns text only. Swap for a real token counter with the
+            // Phase 5 QUIC inference transport.
             updateStats {
                 it.copy(
                     tokensDecoded = it.tokensDecoded + maxTokens,

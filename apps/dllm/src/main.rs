@@ -103,7 +103,8 @@ async fn run_serve(port: u16) -> anyhow::Result<()> {
             Arc::new(dllm_core::MockEngine::new())
         }
     };
-    let state = dllm_serve::new_state_with_node(engine, store, node);
+    let state = dllm_serve::new_state_with_node(engine, store.clone(), node);
+    dllm_serve::spawn_maintenance(store, dllm_serve::DEFAULT_EVENT_TTL_SECS);
     let app = dllm_serve::router(state);
 
     // mDNS advertise `_dllm._tcp.local.` (discovery only; no inference here).

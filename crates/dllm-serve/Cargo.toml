@@ -16,3 +16,9 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 dllm-core = { path = "../dllm-core" }
 dllm-store = { path = "../dllm-store" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+# Wire-format property tests live here because dllm-net itself is
+# off-limits to edits in this change.
+dllm-net = { path = "../dllm-net" }
