@@ -24,3 +24,13 @@
 - `Invoke-WebRequest` fails here (NonInteractive) — scripts must use `curl.exe`.
 - `winget` needs `--source winget` (msstore source prompts and fails headless).
 - Don't `cd` in tool calls; use full paths / workdir param.
+
+## Phase 1 build prerequisites
+
+- cargo at `%USERPROFILE%\.cargo\bin` (rustup stable-gnu, no admin; ensure on PATH).
+- WinLibs MinGW `mingw64\bin` MUST be on PATH or `windows-sys` fails with `dlltool.exe: program not found` (provides gcc/ld/dlltool/ar; see ADR-012).
+- cmake 4.4 + ninja from winget user-scope: `winget install --source winget --exact --id Kitware.CMake --scope user`, same for `Ninja-build.Ninja`; then glob the bin dirs under `%LOCALAPPDATA%\Microsoft\WinGet\Packages\...` and add both to PATH (llama.cpp build needs both).
+- `LIBCLANG_PATH=C:\Users\shiva\AppData\Local\Programs\Python\Python314\Lib\site-packages\clang\native` (via `py -m pip install libclang`) for bindgen.
+- PowerShell JSON quoting rule: never inline JSON with `curl.exe -d`; write body to file and use `curl --data-binary @file`.
+- Shortcut: `. .\scripts\build-env.ps1` from the repo root sets ALL of the above (PATH, LIBCLANG_PATH, CMAKE_GENERATOR=Ninja, CFLAGS/CXXFLAGS, BINDGEN_EXTRA_CLANG_ARGS with MinGW includes, RUSTFLAGS for advapi32 + libllama-common-base.a). Re-run it in every fresh shell before cargo. Never set `$ErrorActionPreference='Stop'` with `2>&1` — it turns cargo's stderr progress into terminating errors.
+- Runtime: `target\...\debug\dllm.exe` needs MinGW DLLs beside it (`libgomp-1`, `libstdc++-6`, `libgcc_s_seh-1`, `libwinpthread-1`, `libdl` — copy from WinLibs `mingw64\bin`; `target/` is gitignored so re-copy after clean builds).

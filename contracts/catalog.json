@@ -21,40 +21,43 @@
         "repo": "unsloth/Qwen3-0.6B-GGUF",
         "file": "Qwen3-0.6B-Q4_K_M.gguf",
         "url": "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
-        "sha256": "TODO-SHA256",
-        "bytes": 416354304
+        "sha256": "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a",
+        "bytes": 396705472
       },
       "files": [
         {
           "role": "shared-tensors",
           "sha256": "TODO-SHA256",
-          "bytes": 167772160,
+          "bytes": 155266337,
           "url": "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
-          "note": "embed (tied, Q8_0/F16) + output_norm + metadata; byte-range of source until splitter ships standalone shards"
+          "note": "embed (tied, Q8_0/F16) + output_norm + metadata; byte-range of source until splitter ships standalone shards; files[].sha256 TODO (range hash, not whole file)"
         },
         {
           "role": "layer-shard",
           "layer_start": 0,
           "layer_end": 8,
           "sha256": "TODO-SHA256",
-          "bytes": 83886080,
-          "url": "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf"
+          "bytes": 77633168,
+          "url": "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
+          "note": "byte-range of source; sha256 TODO (range hash, not whole file)"
         },
         {
           "role": "layer-shard",
           "layer_start": 9,
           "layer_end": 18,
           "sha256": "TODO-SHA256",
-          "bytes": 93113530,
-          "url": "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf"
+          "bytes": 86172799,
+          "url": "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
+          "note": "byte-range of source; sha256 TODO (range hash, not whole file)"
         },
         {
           "role": "layer-shard",
           "layer_start": 19,
           "layer_end": 27,
           "sha256": "TODO-SHA256",
-          "bytes": 83886080,
-          "url": "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf"
+          "bytes": 77633168,
+          "url": "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
+          "note": "byte-range of source; sha256 TODO (range hash, not whole file)"
         }
       ],
       "default_plan": {
@@ -88,39 +91,42 @@
         "file": "Qwen3-0.6B-Q8_0.gguf",
         "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
         "sha256": "TODO-SHA256",
-        "bytes": 670040064
+        "bytes": 639446688
       },
       "files": [
         {
           "role": "shared-tensors",
           "sha256": "TODO-SHA256",
-          "bytes": 167772160,
+          "bytes": 183222548,
           "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
-          "note": "embed (tied) + output_norm + metadata; byte-range of source until splitter ships standalone shards"
+          "note": "embed (tied) + output_norm + metadata; byte-range of source until splitter ships standalone shards; files[].sha256 TODO (range hash, not whole file)"
         },
         {
           "role": "layer-shard",
           "layer_start": 0,
           "layer_end": 8,
           "sha256": "TODO-SHA256",
-          "bytes": 134217728,
-          "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"
+          "bytes": 146578037,
+          "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
+          "note": "byte-range of source; sha256 TODO (range hash, not whole file)"
         },
         {
           "role": "layer-shard",
           "layer_start": 9,
           "layer_end": 18,
           "sha256": "TODO-SHA256",
-          "bytes": 149317222,
-          "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"
+          "bytes": 163068066,
+          "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
+          "note": "byte-range of source; sha256 TODO (range hash, not whole file)"
         },
         {
           "role": "layer-shard",
           "layer_start": 19,
           "layer_end": 27,
           "sha256": "TODO-SHA256",
-          "bytes": 134217728,
-          "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"
+          "bytes": 146578037,
+          "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
+          "note": "byte-range of source; sha256 TODO (range hash, not whole file)"
         }
       ],
       "default_plan": {

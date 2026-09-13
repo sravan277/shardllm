@@ -12,3 +12,8 @@
 - **ADR-010 — Layer-execution spike opens Phase 3.** llama.cpp public API has no layer-range run; options ranked RPC-sidecar > custom shard forwarder > sys-fork > candle. Data-parallel fallback ships value regardless.
 - **ADR-011 — Minimal tooling policy.** 2 remote MCPs (context7, gh_grep) + reputable project-local skills only; no low-trust binaries; heavy tools enabled per-task. Rejections logged in `docs/MCP_SKILLS.md`.
 - **ADR-012 — WinLibs MinGW UCRT over zig-as-linker.** Bare `zig` as cargo linker chokes on rustc's `-fno-use-linker-plugin`, and `windows-sys` needs real `dlltool.exe`. User-space WinLibs gives gcc/ld/dlltool/ar with no admin.
+- **ADR-013 — llama-cpp-2 pinned `=0.1.156`.** Only maintained binding in 2026; CPU-only default features; no CUDA/Vulkan on MinGW.
+- **ADR-014 — Model weights dir `%LOCALAPPDATA%\dllm\models\` outside repo.** Fallback `./models/` if `LOCALAPPDATA` unset; keeps weights out of git.
+- **ADR-015 — Pull = single-file HF download + Range resume + size verify (+ sha when known.** `model_dir()` + `.part` sidecar, `Range: bytes={have}-`, progress log, `bytes` size check, sha256 check skipped while catalog is `TODO-SHA256`; `files[]` stay byte-ranges of same URL until Phase 3 splitter.
+- **ADR-016 — Q4_K_M unsloth ~397MB vs Q8 official ~639MB.** Q4 default for LAN fit; Q8 kept as quality option (one pinned publisher per quant per ADR-007).
+- **ADR-017 — sha256 not published by HF (verify via download + sidecar).** No upstream hash to pin; verify byte-size + hash-on-download, record observed hash in `.sha256` sidecar next to weights for audit.

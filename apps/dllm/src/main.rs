@@ -1,8 +1,11 @@
-//! `dllm` CLI: serve / list / pull / run / ps (Phase 0 mocks).
+//! `dllm` CLI: serve / list / pull / run / ps (Phase 1: real pull).
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
+use sha2::{Digest, Sha256};
 
 /// Baked catalog (same file served by `GET /api/models`).
 /// Requires `contracts/catalog.json` at compile time (contracts mate owns it).
@@ -52,14 +55,8 @@ async fn main() -> anyhow::Result<()> {
             cmd_list();
             Ok(())
         }
-        Commands::Pull { model } => {
-            cmd_pull(&model);
-            Ok(())
-        }
-        Commands::Run { model } => {
-            cmd_run(&model);
-            Ok(())
-        }
+        Commands::Pull { model } => cmd_pull(&model).await,
+        Commands::Run { model } => cmd_run(&model).await,
         Commands::Ps => {
             cmd_ps();
             Ok(())
@@ -69,7 +66,24 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_serve(port: u16) -> anyhow::Result<()> {
     let store = Arc::new(dllm_store::Store::open("dllm-events.db")?);
-    let engine = Arc::new(dllm_core::MockEngine::new());
+    // Prefer real inference when weights are present; the server must never
+    // fail to start for lack of weights, so fall back to MockEngine.
+    let engine: Arc<dyn dllm_core::Engine> = match qwen_q4_path() {
+        Some(path) => match dllm_core::LlamaEngine::load(&path, 4096) {
+            Ok(llama) => {
+                tracing::info!(path = %path.display(), "serving with LlamaEngine");
+                Arc::new(llama)
+            }
+            Err(e) => {
+                tracing::warn!("{e:#}; falling back to MockEngine");
+                Arc::new(dllm_core::MockEngine::new())
+            }
+        },
+        None => {
+            tracing::warn!("qwen3-0.6b-q4 not in catalog; serving with MockEngine");
+            Arc::new(dllm_core::MockEngine::new())
+        }
+    };
     let state = dllm_serve::new_state(engine, store);
     let app = dllm_serve::router(state);
 
@@ -101,6 +115,56 @@ fn parse_catalog() -> serde_json::Value {
     serde_json::from_str(CATALOG_JSON).unwrap_or(serde_json::Value::Null)
 }
 
+fn find_model<'a>(v: &'a serde_json::Value, model: &str) -> Option<&'a serde_json::Value> {
+    v.get("models").and_then(|m| m.as_array()).and_then(|models| {
+        models.iter().find(|m| {
+            m.get("name").and_then(|s| s.as_str()) == Some(model)
+                || m.get("id").and_then(|s| s.as_str()) == Some(model)
+        })
+    })
+}
+
+/// Catalog path of the Q4 weights (`%LOCALAPPDATA%\dllm\models\...`), if known.
+fn qwen_q4_path() -> Option<PathBuf> {
+    let v = parse_catalog();
+    let m = find_model(&v, "qwen3-0.6b-q4")?;
+    let (path, _, _, _) = model_file(m)?;
+    Some(path)
+}
+
+/// Model weights live outside the repo: `%LOCALAPPDATA%\dllm\models\` (else `./models/`).
+fn model_dir() -> PathBuf {
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        PathBuf::from(local).join("dllm").join("models")
+    } else {
+        PathBuf::from("models")
+    }
+}
+
+fn model_file(m: &serde_json::Value) -> Option<(PathBuf, String, u64, String)> {
+    let src = m.get("source")?;
+    let file = src.get("file")?.as_str()?.to_string();
+    let url = src.get("url")?.as_str()?.to_string();
+    let bytes = src.get("bytes")?.as_u64()?;
+    let sha = src
+        .get("sha256")
+        .and_then(|s| s.as_str())
+        .unwrap_or("TODO-SHA256")
+        .to_string();
+    Some((model_dir().join(&file), url, bytes, sha))
+}
+
+fn installed_state(m: &serde_json::Value) -> &'static str {
+    match model_file(m) {
+        Some((path, _, expected, _)) => match std::fs::metadata(&path) {
+            Ok(md) if md.len() == expected => "installed",
+            Ok(_) => "partial",
+            Err(_) => "catalog",
+        },
+        None => "catalog",
+    }
+}
+
 fn cmd_list() {
     let v = parse_catalog();
     match v.get("models").and_then(|m| m.as_array()) {
@@ -111,11 +175,7 @@ fn cmd_list() {
                     .or_else(|| m.get("id"))
                     .and_then(|s| s.as_str())
                     .unwrap_or("?");
-                let state = m
-                    .get("state")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("catalog");
-                println!("{name}\t{state}");
+                println!("{name}\t{}", installed_state(m));
             }
         }
         None => {
@@ -125,54 +185,135 @@ fn cmd_list() {
     }
 }
 
-fn cmd_pull(model: &str) {
+/// Real resumable download of the model's source GGUF + size/sha verify.
+/// (Shard `files[]` stay byte-ranges of this same URL until the Phase 3 splitter.)
+async fn cmd_pull(model: &str) -> anyhow::Result<()> {
     let v = parse_catalog();
-    let found = v
-        .get("models")
-        .and_then(|m| m.as_array())
-        .and_then(|models| {
-            models.iter().find(|m| {
-                m.get("name").and_then(|s| s.as_str()) == Some(model)
-                    || m.get("id").and_then(|s| s.as_str()) == Some(model)
-            })
-        });
-    match found {
-        Some(m) => {
-            println!("fetch plan for {model} (Phase 0: plan only, no download yet):");
-            // Real catalog shape: `files[]` with {role, bytes, layer_start, layer_end, url}.
-            if let Some(files) = m.get("files").or_else(|| m.get("shards")).and_then(|f| f.as_array()) {
-                let total: u64 = files
-                    .iter()
-                    .filter_map(|f| f.get("bytes").and_then(|b| b.as_u64()))
-                    .sum();
-                for f in files {
-                    let role = f.get("role").and_then(|s| s.as_str()).unwrap_or("?");
-                    let bytes = f.get("bytes").and_then(|b| b.as_u64()).unwrap_or(0);
-                    match (f.get("layer_start").and_then(|n| n.as_u64()), f.get("layer_end").and_then(|n| n.as_u64())) {
-                        (Some(s), Some(e)) => println!("  {role} layers {s}-{e}: {bytes} bytes"),
-                        _ => println!("  {role}: {bytes} bytes"),
-                    }
-                }
-                println!("total bytes: {total}");
-            }
-            if let Some(ranges) = m.get("ranges").or_else(|| {
-                m.get("default_plan").or_else(|| m.get("layers"))
-            }) {
-                println!("ranges: {ranges:#}");
-            }
-            // Always show the raw entry so shard hashes/boundaries are auditable.
-            println!("{m:#}");
-            println!("note: real resumable download + hash-verify lands in Phase 1.");
-        }
+    let m = find_model(&v, model);
+    let m = match m {
+        Some(m) => m,
         None => {
             println!("model '{model}' not in catalog; try `dllm list`.");
+            return Ok(());
+        }
+    };
+    let (dest, url, expected, sha) = model_file(m)
+        .ok_or_else(|| anyhow::anyhow!("catalog entry '{model}' lacks source {{file,url,bytes}}"))?;
+    std::fs::create_dir_all(model_dir())?;
+
+    if let Ok(md) = std::fs::metadata(&dest) {
+        if md.len() == expected {
+            println!("{} already present ({} bytes, verified).", dest.display(), expected);
+            return Ok(());
+        }
+        println!(
+            "existing {} has {} bytes (want {expected}); re-downloading.",
+            dest.display(),
+            md.len()
+        );
+    }
+
+    // Resume via `.part` sidecar; server (HuggingFace) supports Range.
+    let part = dest.with_extension("part");
+    let have = std::fs::metadata(&part).map(|md| md.len()).unwrap_or(0);
+    if have >= expected && expected > 0 {
+        std::fs::remove_file(&part)?;
+    }
+    let have = std::fs::metadata(&part).map(|md| md.len()).unwrap_or(0);
+
+    let client = reqwest::Client::builder().user_agent("dllm/0.1.0").build()?;
+    let mut req = client.get(&url);
+    if have > 0 {
+        req = req.header("Range", format!("bytes={have}-"));
+    }
+    let resp = req.send().await?.error_for_status()?;
+    let resumed = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if have > 0 && !resumed {
+        // Server ignored Range: restart from scratch.
+        std::fs::remove_file(&part)?;
+    }
+    let total = resp.content_length().unwrap_or(expected.saturating_sub(have)) + if resumed { have } else { 0 };
+
+    println!(
+        "pull {model}: {} -> {} ({} total bytes{})",
+        url,
+        dest.display(),
+        total,
+        if resumed { ", resuming" } else { "" }
+    );
+    let mut out = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(resumed)
+        .write(true)
+        .truncate(!resumed)
+        .open(&part)
+        .await?;
+    // Seed the hasher with existing prefix when resuming (re-read part file).
+    let mut hasher = Sha256::new();
+    if resumed {
+        use tokio::io::AsyncReadExt;
+        let mut f = tokio::fs::File::open(&part).await?;
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = f.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
         }
     }
+
+    use tokio::io::AsyncWriteExt;
+    let mut done = if resumed { have } else { 0 };
+    let t0 = Instant::now();
+    let mut last_print = Instant::now();
+    let mut resp = resp;
+    while let Some(chunk) = resp.chunk().await? {
+        out.write_all(&chunk).await?;
+        hasher.update(&chunk);
+        done += chunk.len() as u64;
+        if last_print.elapsed().as_secs() >= 2 {
+            let pct = if total > 0 { done as f64 * 100.0 / total as f64 } else { 0.0 };
+            let mb_s = done as f64 / t0.elapsed().as_secs_f64() / 1e6;
+            println!("  {done}/{total} bytes ({pct:.1}%) @ {mb_s:.1} MB/s");
+            last_print = Instant::now();
+        }
+    }
+    out.flush().await?;
+    drop(out);
+
+    let digest = format!("{:x}", hasher.finalize());
+    if done != expected {
+        anyhow::bail!("size mismatch: got {done} bytes, catalog wants {expected}");
+    }
+    if !sha.starts_with("TODO") && !sha.eq_ignore_ascii_case(&digest) {
+        anyhow::bail!("sha256 mismatch: got {digest}, catalog wants {sha}");
+    }
+    tokio::fs::rename(&part, &dest).await?;
+    // Audit trail: record the observed hash next to the weights.
+    std::fs::write(dest.with_extension("sha256"), format!("{digest}\n"))?;
+    println!("pulled {model}: {} bytes, sha256 {digest}", expected);
+    if sha.starts_with("TODO") {
+        println!("note: catalog sha256 is still TODO — paste this hash into contracts/catalog.json.");
+    }
+    Ok(())
 }
 
-fn cmd_run(model: &str) {
-    println!("run {model}: auto-pull if missing (Phase 1), then serve + open web UI.");
-    println!("Phase 0: start `dllm serve --port 8080`, then open http://127.0.0.1:8080/");
+async fn cmd_run(model: &str) -> anyhow::Result<()> {
+    // Auto-pull if missing, then serve (engine swap is the next Phase 1 step).
+    let v = parse_catalog();
+    let need_pull = match find_model(&v, model) {
+        Some(m) => !matches!(installed_state(m), "installed"),
+        None => {
+            println!("model '{model}' not in catalog; try `dllm list`.");
+            return Ok(());
+        }
+    };
+    if need_pull {
+        cmd_pull(model).await?;
+    }
+    println!("run {model}: weights ready; serving (open http://127.0.0.1:8080/).");
+    run_serve(8080).await
 }
 
 fn cmd_ps() {

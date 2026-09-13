@@ -10,3 +10,4 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+llama-cpp-2 = { workspace = true }

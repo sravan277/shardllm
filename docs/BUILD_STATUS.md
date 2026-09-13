@@ -1,6 +1,6 @@
 # Build Status (LIVING — update on every artifact change)
 
-> Last updated: Phase 0 all artifacts built (2026-09-13).
+> Last updated: Phase 1 pull/list/run landed; engine swap + bench IN PROGRESS (2026-09-13).
 
 | Artifact | Path | Status | Blocker / next |
 |----------|------|--------|----------------|
@@ -11,7 +11,12 @@
 | Web `dist/` | `apps/web/dist` (226 KB js) | DONE | built; served by `dllm serve` at `/` |
 | Android scaffold | `apps/android` (18 files) | DONE (uncompiled) | SDK install via `setup-android.ps1` |
 | `app-debug.apk` | `apps/android/app/build/outputs/apk/debug/app-debug.apk` (77 MB) | DONE | AGP 8.7.3 + JDK 17 + SDK 35; install on device to test |
-| Model weights | — | PLANNED Phase 1 | unsloth Q4_K_M 397 MB |
+| `dllm pull` | `apps/dllm/src/main.rs` (`cmd_pull`) | DONE | real resumable download: `model_dir` + `.part` resume + progress + size/sha verify + `.sha256` sidecar |
+| `dllm list` | `apps/dllm/src/main.rs` (`cmd_list`) | DONE | shows installed state (`installed`/`partial`/`catalog` by size check) |
+| `dllm run` | `apps/dllm/src/main.rs` (`cmd_run`) | DONE | pull-if-missing + serve |
+| Model weights | `%LOCALAPPDATA%\dllm\models\` | PLANNED Phase 1 | unsloth Q4_K_M 397 MB |
+| Engine swap (llama-cpp-2) | `apps/dllm` | IN PROGRESS (sibling agent) | CPU-only `=0.1.156` |
+| Bench | — | IN PROGRESS (sibling agent) | — |
 | Research | `docs/research/` (6 files) | DONE | — |
 | Master plan | `docs/MASTER_PLAN.md` | DONE | deltas logged in research/00-index |
 

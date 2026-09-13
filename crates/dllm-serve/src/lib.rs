@@ -22,7 +22,7 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use dllm_core::{Engine, MockEngine};
+use dllm_core::Engine;
 use dllm_store::Store;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -48,13 +48,13 @@ pub struct SseMsg {
 
 /// Shared app state.
 pub struct AppState {
-    pub engine: Arc<MockEngine>,
+    pub engine: Arc<dyn Engine>,
     pub store: Arc<Store>,
     pub tx: broadcast::Sender<SseMsg>,
 }
 
 /// Build shared state with a 256-slot broadcast channel.
-pub fn new_state(engine: Arc<MockEngine>, store: Arc<Store>) -> Arc<AppState> {
+pub fn new_state(engine: Arc<dyn Engine>, store: Arc<Store>) -> Arc<AppState> {
     let (tx, _rx) = broadcast::channel(256);
     Arc::new(AppState { engine, store, tx })
 }
@@ -153,7 +153,7 @@ async fn post_message(
         data: user_payload,
     });
 
-    // Spawn mock generation -> store + broadcast.
+    // Spawn generation (real or mock, per the engine) -> store + broadcast.
     let mut rx = state.engine.generate_stream(prompt);
     let state2 = state.clone();
     let session_id = id.clone();

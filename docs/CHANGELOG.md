@@ -1,5 +1,11 @@
 # Changelog (newest first — append on every change)
 
+## 2026-09-13 — Phase 1 real `pull`/`list`/`run` + toolchain
+
+- `dllm pull`: real resumable HF single-file download (`model_dir` `%LOCALAPPDATA%\dllm\models\`, `.part` + `Range` resume, progress log, size/sha verify, `.sha256` sidecar); `list` shows `installed`/`partial`/`catalog`; `run` = pull-if-missing + serve (`apps/dllm/src/main.rs`).
+- Toolchain installs (user-scope, no admin): WinLibs MinGW `mingw64\bin` on PATH, cmake 4.4 + ninja via winget, `libclang` via `py -m pip install` (`LIBCLANG_PATH=...site-packages\clang\native`), llama-cpp-2 `=0.1.156` CPU-only.
+- Engine swap + bench IN PROGRESS (sibling agents).
+
 ## 2026-09-13 — Phase 0 verified E2E (exe + site live)
 
 - `dllm.exe` built (113 MB debug, WinLibs MinGW UCRT + gnu toolchain) and smoke-tested: `/api/health` → `{"ok":true,"proto":"dllm1"}`; `POST /v1/sessions` → id; message accepted; SSE streams `session_created`/`user_message`/tokens with event ids; `/` serves built web UI.
