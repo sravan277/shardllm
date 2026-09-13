@@ -13,3 +13,4 @@ tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+sha2 = { workspace = true }

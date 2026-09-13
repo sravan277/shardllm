@@ -6,6 +6,9 @@
 /// ALPN protocol id — must match on both ends or the handshake fails silently.
 pub const ALPN: &[u8] = b"dllm/1";
 
+/// Quinn 0.11 mTLS transport with TOFU fingerprint pinning.
+pub mod transport;
+
 /// Wire magic prefix for every activation frame.
 pub const FRAME_MAGIC: &[u8; 5] = b"DLLM1";
 
@@ -135,6 +138,6 @@ pub fn dev_identity() -> Result<(Vec<u8>, Vec<u8>), NetError> {
     let certified =
         rcgen::generate_simple_self_signed(vec!["dllm.local".to_string()])?;
     let cert_der = certified.cert.der().to_vec();
-    let key_der = certified.key_pair.serialize_der();
+    let key_der = certified.signing_key.serialize_der();
     Ok((cert_der, key_der))
 }

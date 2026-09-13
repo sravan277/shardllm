@@ -1,5 +1,10 @@
 # Changelog (newest first — append on every change)
 
+## 2026-09-13 — Phase 3 headless pipe_pair drill (transport+planner+commit)
+
+- Added `crates/dllm-core/examples/pipe_pair.rs` (zero manifest edits): 2 identities with swapped fingerprints, worker `server()` on 127.0.0.1:8443, coordinator `connect()` strict; `plan_layers(28, [16.6 tok/s local, remote])` → 2 stages over Control stream → worker Ack; 8 `ActivationFrame`s over Activation via `frame_channel`/`spawn_frame_recv_loop` with `KvTentative` per frame; piggyback `on_commit(7)`, `on_truncate(6)` + resend 6,7 as new tokens, re-commit to `committed_pos=Some(7)`; worker saw truncate. Prints `PIPE_PAIR PASS stages=2 layers=28 frames=10 resends=2 committed_pos=7`.
+- Docs: ADRs 018–022 (mTLS TOFU, stream priorities, cap-4 backpressure, calibration planner, port 8443); `BUILD_STATUS.md` Phase 3 rows DONE, 2-physical-device pipeline stays PLANNED.
+
 ## 2026-09-13 — Phase 1 real `pull`/`list`/`run` + toolchain
 
 - `dllm pull`: real resumable HF single-file download (`model_dir` `%LOCALAPPDATA%\dllm\models\`, `.part` + `Range` resume, progress log, size/sha verify, `.sha256` sidecar); `list` shows `installed`/`partial`/`catalog`; `run` = pull-if-missing + serve (`apps/dllm/src/main.rs`).

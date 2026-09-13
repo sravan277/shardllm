@@ -555,6 +555,7 @@ name = "dllm-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dllm-net",
  "llama-cpp-2",
  "serde",
  "serde_json",
@@ -573,6 +574,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde",
+ "sha2",
  "thiserror",
  "tokio",
  "tokio-rustls",

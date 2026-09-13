@@ -19,6 +19,11 @@
 | Bench | `crates/dllm-core/examples/bench_local.rs` + `docs/bench-baseline.json` | DONE (mean decode 16.6 tok/s, Qwen3-0.6B Q4_K_M, n_ctx 4096) | — |
 | Research | `docs/research/` (6 files) | DONE | — |
 | Master plan | `docs/MASTER_PLAN.md` | DONE | deltas logged in research/00-index |
+| Quinn mTLS transport (TOFU) | `crates/dllm-net/src/transport.rs` | DONE | `server`/`connect`, fp pinning, Control20>Ack10>Activation0, cap-4 backpressure; tests green |
+| Calibration planner | `crates/dllm-core/src/plan.rs` (`plan_layers`) | DONE | minimizes max stage time; tests green |
+| Commit tracker | `crates/dllm-core/src/commit.rs` | DONE | piggyback/TRUNCATE, `on_ack` routing; tests green |
+| Headless pipe_pair drill | `crates/dllm-core/examples/pipe_pair.rs` | DONE | `PIPE_PAIR PASS` (2 stages, 10 frames, committed_pos=7, truncate seen) on 127.0.0.1:8443 |
+| 2-physical-device pipeline | — | PLANNED | needs 2nd device + pairing UX; logic proven headless only |
 
 ## Blockers log
 

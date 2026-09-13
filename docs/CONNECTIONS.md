@@ -30,7 +30,7 @@
 | E1 | Web → dllm | HTTP JSON + SSE | 8080 | LAN allow-list (Phase 3) | LIVE (health/models/sessions/SSE) | `contracts/openapi.yaml` |
 | E2 | Android → dllm | HTTP JSON + SSE (OkHttp) | 8080 | LAN allow-list (Phase 3) | LIVE server-side; app scaffolded | `contracts/openapi.yaml` |
 | E3 | dllm ↔ all | mDNS `_dllm._tcp.local.` TXT(quic_port,node_id,model,ver) | 5353 | none (discovery only) | advertise live; browse stub | `contracts/pairing.md` |
-| E4 | Stage N → N+1 | QUIC + mTLS, ALPN `dllm/1`, ActivationFrame v1 | 8443 | mutual TLS, pinned CA | PLANNED Phase 3 (codec exists in `dllm-net`) | `contracts/activation-frame.md`, `acks.md` |
+| E4 | Stage N → N+1 | QUIC + mTLS, ALPN `dllm/1`, ActivationFrame v1 | 8443/udp | mutual TLS, TOFU fingerprints | DONE headless (`pipe_pair` loopback 127.0.0.1:8443); 2-device PLANNED | `contracts/activation-frame.md`, `acks.md` |
 | E5 | dllm → Cloud | HTTPS background queue, zstd+age chunks | 443 | user token, opt-in only | PLANNED Phase 5 | MASTER_PLAN §13 |
 | E6 | tray ↔ svc | loopback HTTP (same API) | 8080 | local-only bind | PLANNED (two-binary split) | research/02 §6 |
 
@@ -45,7 +45,7 @@
 ## Ports / names registry (do not collide)
 
 - `8080` LAN HTTP API + SSE + web dist (dev override `--port`).
-- `8443` QUIC worker traffic (TXT `quic_port`; dev override).
+- `8443/udp` QUIC worker traffic, ALPN `dllm/1` (TXT `quic_port`; dev override).
 - `5353/udp` mDNS (system).
 - ALPN `dllm/1`. mDNS type `_dllm._tcp.local.`. Mutex `Global\dllm-coordinator-v1`.
 
