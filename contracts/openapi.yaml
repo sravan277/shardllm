@@ -18,6 +18,59 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Health'
+  /api/node:
+    get:
+      operationId: nodeInfo
+      summary: Stable node_id + fingerprint + quic_port (pairing bootstrap)
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+  /api/stats:
+    get:
+      operationId: stats
+      summary: uptime_s / engine / sessions / events / node_id
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [uptime_s, engine, sessions, events, node_id]
+                properties:
+                  uptime_s: { type: integer }
+                  engine: { type: string, enum: [llama, mock] }
+                  sessions: { type: integer }
+                  events: { type: integer }
+                  node_id: { type: string }
+  /api/pairing-uri:
+    get:
+      operationId: pairingUri
+      summary: Canonical pairing URI string (single source of truth with `dllm id`) + all LAN candidates
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [uri, candidates]
+                properties:
+                  uri:
+                    type: string
+                    example: dllm://pair?host=192.168.1.10&port=8080&quic=8443&fp=abc123&v=0.1.0
+                  candidates:
+                    type: array
+                    description: All local IPv4s best-first (192.168 > 10 > 172.16 > other). If the phone cannot reach `uri`, retry with another candidate.
+                    items:
+                      type: string
+                  warning:
+                    type: string
+                    description: Present when multiple local IPs exist (multi-homed host, VPN/PPP).
   /api/models:
     get:
       operationId: listModels
@@ -65,21 +118,132 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Session'
+    get:
+      operationId: listSessions
+      summary: Real activity feed rolled up from the event log
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions]
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SessionSummary'
+  /v1/sessions/{id}:
+    delete:
+      operationId: deleteSession
+      summary: Delete a session — removes its events + rename so it disappears from list + events (404 unknown)
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, id]
+                properties:
+                  ok: { type: boolean }
+                  id: { type: string }
+        '404':
+          description: unknown session (honest absent, nothing invented)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+  /v1/sessions/{id}/rename:
+    post:
+      operationId: renameSession
+      summary: Rename a session — trimmed 1-80 chars, persisted prune-resistant so web + Android stay in sync (404 unknown)
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title:
+                  type: string
+                  minLength: 1
+                  maxLength: 80
+                  example: Trip to Kyoto
+      responses:
+        '200':
+          description: renamed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, id, title]
+                properties:
+                  ok: { type: boolean }
+                  id: { type: string }
+                  title: { type: string }
+        '400':
+          description: empty or over-80-char title
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+        '404':
+          description: unknown session (honest absent, nothing invented)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
   /v1/sessions/{id}/events:
     get:
       operationId: sessionEvents
-      summary: SSE stream (token/commit/status/keep-alive). Resume with Last-Event-ID.
+      summary: SSE stream (token/commit/status/keep-alive). Resume with ?last_event=K or Last-Event-ID. Unknown/deleted session -> 404 {ok:false}.
       parameters:
         - $ref: '#/components/parameters/SessionId'
         - $ref: '#/components/parameters/LastEventId'
+        - name: last_event
+          in: query
+          required: false
+          description: Replay id>K (preferred — browsers' EventSource cannot send headers).
+          schema:
+            type: integer
+            minimum: 0
       responses:
         '200':
-          description: text/event-stream
+          description: text/event-stream (contract shapes; id = events.id)
           content:
             text/event-stream:
               schema:
                 type: string
-                example: "event: token\ndata: {\"pos\":12,\"token\":1234}\n\n"
+                example: "event: token\nid: 41\ndata: {\"pos\":12,\"text\":\" hello\"}\n\nevent: commit\nid: 42\ndata: {\"pos\":12}\n\nevent: status\nid: 43\ndata: {\"state\":\"serving\"}\n\n"
+        '404':
+          description: unknown/deleted session (honest absent — deleted sessions lose their SSE resume position)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
   /v1/sessions/{id}/messages:
     post:
       operationId: postMessage
@@ -110,7 +274,7 @@ paths:
   /v1/devices:
     get:
       operationId: listDevices
-      summary: Paired devices + capabilities
+      summary: Paired devices from the SQLite registry (self first, active = seen within 90 s)
       responses:
         '200':
           description: ok
@@ -118,33 +282,167 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [devices]
                 properties:
                   devices:
                     type: array
                     items:
                       $ref: '#/components/schemas/Device'
+  /v1/devices/heartbeat:
+    post:
+      operationId: deviceHeartbeat
+      summary: Worker lifeline — upsert (default role worker, status paired) + touch last_seen + store name/load/caps
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id]
+              properties:
+                device_id: { type: string }
+                role: { type: string, default: worker }
+                permissions:
+                  type: array
+                  items: { type: string }
+                cert_fp: { type: string }
+                device_name:
+                  type: string
+                  nullable: true
+                  description: Friendly OS hostname; stored on the row, null = unknown (client falls back to id).
+                load:
+                  type: object
+                  description: Reported load sample 0-100; stored + timestamped (never synthesized server-side).
+                  properties:
+                    cpu_pct: { type: number, minimum: 0, maximum: 100 }
+                    mem_pct: { type: number, minimum: 0, maximum: 100 }
+                capabilities:
+                  type: object
+                  description: Reported capabilities JSON; stored on the row.
+                group_id:
+                  type: string
+                  description: Group id to refresh membership last_seen (explicit join required; heartbeat never auto-joins, it only touches an existing member row).
+                worker_active:
+                  type: boolean
+                  description: Whether this device can take pipeline stages; persisted only when sent, never synthesized.
+                layers:
+                  description: Reported layer assignment JSON (e.g. {"layer_start":0,"layer_end":8}); persisted only when sent, never synthesized.
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+  /v1/devices/{id}:
+    get:
+      operationId: deviceDetail
+      summary: Device detail — registry row + honest load + self-only sessions + stage (404 unknown)
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceDetail'
+        '404':
+          description: unknown device (honest absent, nothing invented)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+    delete:
+      operationId: deleteDevice
+      summary: Hard-delete a device row — removes drill junk / stale dupes from the registry (404 unknown; 400 self coordinator, never orphan the mesh). A later heartbeat recreates the row as paired.
+      parameters:
+        - $ref: '#/components/parameters/DeviceId'
+      responses:
+        '200':
+          description: deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, id]
+                properties:
+                  ok: { type: boolean }
+                  id: { type: string }
+        '400':
+          description: refused to delete self coordinator
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+        '404':
+          description: unknown device (honest absent, nothing invented)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
   /v1/devices/{id}/approve:
     post:
       operationId: approveDevice
-      summary: Approve pending joiner (post verify-code)
+      summary: Approve pending joiner (status -> paired; 404 for unknown device)
       parameters:
         - $ref: '#/components/parameters/DeviceId'
       responses:
         '200':
           description: approved
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+        '404':
+          description: unknown device (honest absent, nothing invented)
   /v1/devices/{id}/revoke:
     post:
       operationId: revokeDevice
-      summary: Revoke + push deny-list to workers
+      summary: Revoke (status -> revoked; 404 for unknown device)
       parameters:
         - $ref: '#/components/parameters/DeviceId'
       responses:
         '200':
           description: revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+        '404':
+          description: unknown device (honest absent, nothing invented)
   /v1/plan:
     get:
       operationId: activePlan
-      summary: Active pipeline plan + per-stage latency
+      summary: Honest single-device v1 plan (self runs layers 0-27); ?group= scopes to a network's paired+active worker candidates via plan_layers
+      parameters:
+        - name: group
+          in: query
+          required: false
+          description: Network id to scope the plan to (404 unknown group).
+          schema:
+            type: string
       responses:
         '200':
           description: ok
@@ -152,6 +450,292 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Plan'
+        '404':
+          description: unknown network (?group= only)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+  /v1/networks:
+    get:
+      operationId: listNetworks
+      summary: Private groups (no secrets; auto-seeds the default group so the list is never stubbed-empty)
+      responses:
+        '200':
+          description: ok ({networks:[...]} — clients also accept a bare array)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [networks]
+                properties:
+                  networks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Network'
+    post:
+      operationId: createNetwork
+      summary: Create a network {name (1-40), password? (empty/absent = open), open_join? (default true)} -> {id,qr}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 40, example: Lab mesh }
+                password: { type: string, description: Plaintext; empty/absent = open group. }
+                open_join: { type: boolean, default: true }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, qr]
+                properties:
+                  id: { type: string }
+                  qr:
+                    type: string
+                    example: dllm://net?g=net-abc&h=1a2b3c4d&p=1&fp=abc123&v=0.1.0#s=fullsecret
+        '400':
+          description: bad name (missing/empty/>40 chars)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+  /v1/networks/{id}:
+    get:
+      operationId: networkDetail
+      summary: Group detail (no secret; 404 unknown)
+      parameters:
+        - $ref: '#/components/parameters/NetworkId'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Network'
+        '404':
+          description: unknown network
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+  /v1/networks/{id}/join:
+    post:
+      operationId: joinNetwork
+      summary: Join a group. Web shape {password?} (password check only, no membership row); Android shape {device_id,device_name?,password?,qr_secret?} (creates the member row)
+      parameters:
+        - $ref: '#/components/parameters/NetworkId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                device_id: { type: string, description: Optional for web compat; falls back to the x-device-id header. Absent = anonymous password check. }
+                device_name: { type: string }
+                password: { type: string }
+                qr_secret: { type: string, description: Accepted for Android QR flows; not a second auth gate (ignored). }
+      responses:
+        '200':
+          description: joined (or password ok for anonymous web checks)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  group_id: { type: string }
+                  device_id: { type: string }
+                  role: { type: string, enum: [admin, member] }
+        '401':
+          description: bad password (missing/wrong on a locked group)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string, example: bad-password }
+        '403':
+          description: closed group (open_join=false, joiner is not the admin)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string, example: closed }
+        '404':
+          description: unknown network
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+        '409':
+          description: group full (5 paired members, joiner not already paired)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string, example: full }
+  /v1/networks/{id}/leave:
+    post:
+      operationId: leaveNetwork
+      summary: Leave a group {device_id} (idempotent; admin leaving does not delete the group)
+      parameters:
+        - $ref: '#/components/parameters/NetworkId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id]
+              properties:
+                device_id: { type: string }
+      responses:
+        '200':
+          description: left
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  group_id: { type: string }
+                  device_id: { type: string }
+        '404':
+          description: unknown network
+  /v1/networks/{id}/rotate-qr:
+    post:
+      operationId: rotateNetworkQr
+      summary: Mint a fresh qr_secret (admin only, {device_id}) -> {ok:true,qr}
+      parameters:
+        - $ref: '#/components/parameters/NetworkId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                device_id: { type: string }
+      responses:
+        '200':
+          description: rotated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, qr]
+                properties:
+                  ok: { type: boolean }
+                  qr: { type: string }
+        '403':
+          description: admin only
+        '404':
+          description: unknown network
+  /v1/networks/{id}/devices:
+    get:
+      operationId: networkDevices
+      summary: Group members joined to the registry ({group_id,devices}; each entry carries worker_active/cpu_pct/mem_pct/layers null-when-unknown + live plan layer_start/layer_end)
+      parameters:
+        - $ref: '#/components/parameters/NetworkId'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [group_id, devices]
+                properties:
+                  group_id: { type: string }
+                  devices:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/NetworkDevice'
+        '404':
+          description: unknown network
+  /v1/sessions/{id}/stop:
+    post:
+      operationId: stopSession
+      summary: Cancel a live generation (sets the cancel flag; the decode loop emits status{cancelled}). Idempotent; empty body ok.
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: ok ({ok:true,cancelled:true} when a run was cancelled, {cancelled:false} when idle)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, cancelled]
+                properties:
+                  ok: { type: boolean }
+                  cancelled: { type: boolean }
+        '404':
+          description: unknown session
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+  /v1/usage:
+    get:
+      operationId: usageSummary
+      summary: Usage roll-up for the Usage tab — token/session totals + per-device load/layers + plan mirror (bandwidth null until measured). ?group= is admin-full else totals-only/403.
+      parameters:
+        - name: group
+          in: query
+          required: false
+          description: Network id to scope usage to. Caller identity = ?device_id= (aliases ?caller=/?as=) or the x-device-id header, else the coordinator. Unknown group 404; non-member/revoked 403 (with honest totals in the body); non-admin member 200 totals-only (per_device:[]); admin full per_device + plan.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: ok (all real data, nulls where unknown — never synthesized)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Usage'
+        '403':
+          description: not a member (?group= only; body still carries honest totals)
+        '404':
+          description: unknown network (?group= only)
 components:
   parameters:
     SessionId:
@@ -164,6 +748,13 @@ components:
       name: id
       in: path
       required: true
+      schema:
+        type: string
+    NetworkId:
+      name: id
+      in: path
+      required: true
+      description: Network (group) id.
       schema:
         type: string
     LastEventId:
@@ -197,20 +788,126 @@ components:
         session_id: { type: string, format: uuid }
         plan_id: { type: integer }
         model: { type: string }
-    Device:
+    SessionSummary:
       type: object
-      required: [device_id, role]
+      required: [id, model, created_at, tokens_out, title]
+      properties:
+        id: { type: string }
+        model: { type: string, example: qwen3-0.6b-q4, description: '"unknown" when the session_created payload is missing/unparseable' }
+        created_at: { type: string, format: date-time }
+        tokens_out: { type: integer, description: COUNT of token-kind events }
+        last_token_at: { type: string, format: date-time, nullable: true }
+        title:
+          type: string
+          description: Latest rename if present, else first user message truncated to 40 chars, else "New chat" (server-side default keeps web + Android in sync).
+    Node:
+      type: object
+      required: [node_id, fingerprint, quic_port, version]
+      properties:
+        node_id: { type: string }
+        fingerprint: { type: string }
+        quic_port: { type: integer, example: 8443 }
+        version: { type: string, example: 0.1.0 }
+    Network:
+      type: object
+      required: [id, name, open_join, has_password, admin_device_id, created_at, member_count]
+      description: Private group (secrets never serialized; has_password is a boolean gate flag).
+      properties:
+        id: { type: string }
+        name: { type: string }
+        open_join: { type: boolean }
+        has_password: { type: boolean }
+        admin_device_id: { type: string }
+        created_at: { type: string, format: date-time }
+        member_count: { type: integer, description: COUNT of paired members. }
+    NetworkDevice:
+      type: object
+      required: [device_id, role, status, active, last_seen]
+      description: Group member joined to the registry. worker_active/cpu_pct/mem_pct/layers are null when never reported (never synthesized); layer_start/layer_end come from the live group plan (null when the device holds no stage).
       properties:
         device_id: { type: string }
+        device_name: { type: string, nullable: true }
+        role: { type: string, enum: [admin, member] }
+        status: { type: string, enum: [paired, revoked] }
+        active: { type: boolean, description: true when the member or device row was seen within 90 s }
+        last_seen: { type: string, format: date-time }
+        worker_active: { type: boolean, nullable: true }
+        cpu_pct: { type: number, nullable: true }
+        mem_pct: { type: number, nullable: true }
+        layers: { nullable: true, description: Last reported layer assignment JSON. }
+        layer_start: { type: integer, nullable: true }
+        layer_end: { type: integer, nullable: true }
+    Device:
+      type: object
+      required: [device_id, role, permissions, status, active, last_seen, paired_at, paired_by]
+      properties:
+        device_id: { type: string }
+        device_name:
+          type: string
+          nullable: true
+          description: Friendly OS hostname; null = unknown (client falls back to short id). Server never invents.
         role: { type: string, enum: [coordinator, worker, client] }
         permissions:
           type: array
           items: { type: string }
+        status: { type: string, enum: [paired, revoked] }
+        active: { type: boolean, description: true when last_seen is within 90 s }
+        last_seen: { type: string, format: date-time }
+        paired_at: { type: string, format: date-time }
+        paired_by: { type: string }
         capabilities:
           type: object
+          nullable: true
+          description: Last reported capabilities JSON (null = never reported).
           properties:
             ms_per_layer_decode: { type: number }
             kv_pages: { type: integer }
+    DeviceDetail:
+      type: object
+      required: [device, load, sessions, stage]
+      properties:
+        device:
+          type: object
+          required: [device_id, role, permissions, status, active, last_seen, paired_at, paired_by, cert_fp]
+          properties:
+            device_id: { type: string }
+            device_name: { type: string, nullable: true }
+            role: { type: string }
+            permissions: { type: array, items: { type: string } }
+            status: { type: string, enum: [paired, revoked] }
+            active: { type: boolean }
+            last_seen: { type: string, format: date-time }
+            paired_at: { type: string, format: date-time }
+            paired_by: { type: string }
+            cert_fp: { type: string }
+            capabilities: { type: object, nullable: true }
+        load:
+          type: object
+          required: [source]
+          description: live = fresh sysinfo for self; reported = peer row + updated_at; none = no data (never synthesized).
+          properties:
+            source: { type: string, enum: [live, reported, none] }
+            cpu_pct: { type: number, minimum: 0, maximum: 100 }
+            mem_pct: { type: number, minimum: 0, maximum: 100 }
+            updated_at: { type: string, format: date-time }
+        sessions:
+          type: array
+          description: All current sessions when id == self (single-device serves all); [] for peers.
+          items:
+            type: object
+            required: [id, model, tokens_out]
+            properties:
+              id: { type: string }
+              model: { type: string }
+              tokens_out: { type: integer }
+              last_token_at: { type: string, format: date-time, nullable: true }
+        stage:
+          type: object
+          nullable: true
+          description: Self runs layers 0-27; null for peers.
+          properties:
+            layer_start: { type: integer, example: 0 }
+            layer_end: { type: integer, example: 27 }
     Plan:
       type: object
       required: [plan_id, stages]
@@ -220,11 +917,63 @@ components:
           type: array
           items:
             type: object
-            required: [stage, device_id, layer_start, layer_end, latency_ms]
+            required: [stage, device_id, layer_start, layer_end]
             properties:
               stage: { type: integer }
               device_id: { type: string }
               layer_start: { type: integer }
               layer_end: { type: integer }
-              latency_ms: { type: number }
+              latency_ms: { type: number, description: Planned per-stage latency (absent in single-device v1). }
         bottleneck: { type: integer }
+        note: { type: string, example: single-device fast path }
+    Usage:
+      type: object
+      required: [tokens_out_total, sessions_total, per_device, plan, bandwidth]
+      properties:
+        tokens_out_total: { type: integer, description: SUM of token-kind event counts over all sessions (event log). }
+        sessions_total: { type: integer, description: COUNT of sessions in the event log. }
+        per_device:
+          type: array
+          description: One entry per registry row, self first then by id. Sessions carry no device_id, so self gets all tokens/sessions (single-device serves all) and peers get honest zeros. Load reuses the device-detail honest pattern (live = fresh sysinfo for self; reported = peer row; none = no data, never synthesized).
+          items:
+            type: object
+            required: [device_id, role, active, status, tokens_out, sessions, cpu_pct, mem_pct, load_source, layer_start, layer_end]
+            properties:
+              device_id: { type: string }
+              device_name:
+                type: string
+                nullable: true
+                description: Friendly OS hostname; null = unknown (client falls back to short id). Server never invents.
+              role: { type: string, enum: [coordinator, worker, client] }
+              active: { type: boolean, description: true when last_seen is within 90 s }
+              status: { type: string, enum: [paired, revoked] }
+              tokens_out: { type: integer }
+              sessions: { type: integer }
+              cpu_pct: { type: number, minimum: 0, maximum: 100, nullable: true }
+              mem_pct: { type: number, minimum: 0, maximum: 100, nullable: true }
+              load_source: { type: string, enum: [live, reported, none] }
+              layer_start:
+                type: integer
+                nullable: true
+                description: Self mirrors /v1/plan (0 today); null for peers.
+              layer_end:
+                type: integer
+                nullable: true
+                description: Self mirrors /v1/plan (27 today); null for peers.
+        plan:
+          type: object
+          required: [stages]
+          description: Mirrors /v1/plan truthfully (single stage 0-27 on self today).
+          properties:
+            stages:
+              type: array
+              items:
+                type: object
+                required: [device_id, layer_start, layer_end]
+                properties:
+                  device_id: { type: string }
+                  layer_start: { type: integer }
+                  layer_end: { type: integer }
+        bandwidth:
+          nullable: true
+          description: NOT measured anywhere yet — always explicit null, never fake numbers.

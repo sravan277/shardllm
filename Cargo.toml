@@ -32,3 +32,5 @@ thiserror = { version = "2" }
 reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
 sha2 = { version = "0.10" }
 llama-cpp-2 = { version = "=0.1.156", default-features = false, features = ["openmp"] }
+hostname = { version = "0.4" }
+sysinfo = { version = "0.30" }

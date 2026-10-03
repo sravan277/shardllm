@@ -85,6 +85,23 @@ async fn run_serve(port: u16) -> anyhow::Result<()> {
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
     let store = Arc::new(dllm_store::Store::open("dllm-events.db")?);
+    // Devices registry seed: the self row is real state (coordinator,
+    // paired, just seen) so `GET /v1/devices` count >= 1 is never stubbed.
+    // Friendly name = OS hostname (fallback: node_id, never invented).
+    // Best-effort: a failed seed must not stop serving.
+    {
+        let _ = store.upsert_device(
+            &node_id,
+            "coordinator",
+            r#"["infer","chat"]"#,
+            &fingerprint,
+            &node_id,
+        );
+        let friendly = dllm_serve::self_device_name(&node_id);
+        let _ = store.set_device_name(&node_id, Some(&friendly));
+        let _ = store.touch_last_seen(&node_id);
+        let _ = store.set_status(&node_id, "paired");
+    }
     // Prefer real inference when weights are present; the server must never
     // fail to start for lack of weights, so fall back to MockEngine.
     let engine: Arc<dyn dllm_core::Engine> = match qwen_q4_path() {
@@ -103,7 +120,7 @@ async fn run_serve(port: u16) -> anyhow::Result<()> {
             Arc::new(dllm_core::MockEngine::new())
         }
     };
-    let state = dllm_serve::new_state_with_node(engine, store.clone(), node);
+    let state = dllm_serve::new_state_with_node_and_port(engine, store.clone(), node, port);
     dllm_serve::spawn_maintenance(store, dllm_serve::DEFAULT_EVENT_TTL_SECS);
     let app = dllm_serve::router(state);
 
@@ -219,35 +236,23 @@ fn load_or_create_identity(
     Ok((identity, node_id, fingerprint))
 }
 
-/// Best-effort local IPv4 for the pairing URI (outbound-route trick).
-/// Falls back to `127.0.0.1` when offline or on error.
-fn lan_ipv4() -> String {
-    (|| -> anyhow::Result<String> {
-        let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
-        sock.connect("8.8.8.8:80")?;
-        let ip = sock.local_addr()?.ip();
-        match ip {
-            std::net::IpAddr::V4(v4) if !v4.is_unspecified() => Ok(v4.to_string()),
-            _ => anyhow::bail!("no ipv4 route"),
-        }
-    })()
-    .unwrap_or_else(|_| "127.0.0.1".to_string())
-}
-
+/// Pairing-URI helper. Single source of truth lives in `dllm-serve`
+/// (also serves `GET /api/pairing-uri`).
 fn pairing_uri(host: &str, port: u16, fingerprint: &str) -> String {
-    format!(
-        "dllm://pair?host={host}&port={port}&quic={}&fp={fingerprint}&v={}",
-        dllm_serve::QUIC_PORT,
-        env!("CARGO_PKG_VERSION"),
-    )
+    dllm_serve::pairing_uri(host, port, fingerprint)
 }
 
 fn cmd_id(port: u16) -> anyhow::Result<()> {
     let (_identity, node_id, fingerprint) = load_or_create_identity()?;
-    let host = lan_ipv4();
+    let candidates = dllm_serve::lan_candidates();
+    let host = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(dllm_serve::lan_ipv4);
     let uri = pairing_uri(&host, port, &fingerprint);
     println!("node_id: {node_id}");
     println!("fingerprint: {fingerprint}");
+    println!("candidates: {}", candidates.join(", "));
     println!("{uri}");
     Ok(())
 }

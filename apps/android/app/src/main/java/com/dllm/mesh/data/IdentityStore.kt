@@ -1,6 +1,9 @@
 package com.dllm.mesh.data
 
 import android.content.Context
+import android.os.Build
+import android.provider.Settings
+import android.util.Log
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
@@ -9,6 +12,8 @@ import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.UUID
 
 private val Context.meshDataStore by preferencesDataStore(name = "dllm_mesh")
@@ -22,6 +27,11 @@ private val Context.meshDataStore by preferencesDataStore(name = "dllm_mesh")
  * Private-key note: the signing key itself lives in AndroidKeystore under
  * [KEYSTORE_ALIAS] (TODO Phase 3 pairing crypto). Only the alias name is
  * referenced here — never persist key bytes in DataStore.
+ *
+ * Identity rule (duplicate-device fix): scan / manual / nearby pairing flows
+ * must NEVER write NODE_ID — they only ensure it exists (via [ensureNodeId])
+ * or adopt a user-supplied one (via [setNodeId]). The only writers of NODE_ID
+ * are [ensureNodeId] (first run) and [setNodeId] ("Use existing ID").
  */
 class IdentityStore(private val context: Context) {
 
@@ -34,9 +44,56 @@ class IdentityStore(private val context: Context) {
         private val SERVER_FINGERPRINT = stringPreferencesKey("server_fingerprint")
         private val SERVER_QUIC_PORT = intPreferencesKey("server_quic_port")
         private val SERVER_NODE_ID = stringPreferencesKey("server_node_id")
+        private val GROUP_ID = stringPreferencesKey("group_id")
 
         const val KEYSTORE_ALIAS = "dllm_mesh_signing"
         const val DEFAULT_COORDINATOR_URL = "http://192.168.1.10:8080"
+        private const val TAG = "IdentityStore"
+
+        /** Display name sent as `device_name` — non-unique on purpose (many RMX3785s). */
+        fun stableDeviceName(): String = Build.MODEL
+
+        /**
+         * Single heartbeat-body builder shared by every sender
+         * (Devices presence, WorkerService, Pairing.sendPairRequest via
+         * [com.dllm.mesh.net.Presence]). Keeps device_id / device_name /
+         * role / permissions from diverging again.
+         *
+         * RMX3785 load fix: always emits `load:{cpu_pct,mem_pct}` (0-100,
+         * JSON null when unknown — never synthesized). When this phone
+         * works as a compute worker, callers also pass `capabilities` +
+         * `worker_active=true` + `group_id` + `layers` so the backend
+         * `/v1/plan` can assign layers to it. Unknown fields are ignored by
+         * older coordinators (serde defaults), so this stays compatible.
+         */
+        fun buildHeartbeatBody(
+            deviceId: String,
+            deviceName: String = stableDeviceName(),
+            role: String = "client",
+            cpuPct: Double? = null,
+            memPct: Double? = null,
+            capabilities: JSONObject? = null,
+            workerActive: Boolean? = null,
+            groupId: String? = null,
+            layers: List<Int>? = null,
+        ): String {
+            val body = JSONObject()
+                .put("device_id", deviceId)
+                .put("role", role)
+                .put("permissions", JSONArray(listOf("chat")))
+                .put("device_name", deviceName)
+                .put(
+                    "load",
+                    JSONObject()
+                        .put("cpu_pct", cpuPct ?: JSONObject.NULL)
+                        .put("mem_pct", memPct ?: JSONObject.NULL),
+                )
+            if (capabilities != null) body.put("capabilities", capabilities)
+            if (workerActive != null) body.put("worker_active", workerActive)
+            if (!groupId.isNullOrBlank()) body.put("group_id", groupId)
+            if (layers != null) body.put("layers", JSONArray(layers))
+            return body.toString()
+        }
     }
 
     val nodeId: Flow<String> =
@@ -66,13 +123,51 @@ class IdentityStore(private val context: Context) {
     val serverNodeId: Flow<String> =
         context.meshDataStore.data.map { it[SERVER_NODE_ID] ?: "" }
 
+    /** Active private-group id selected in Networks (empty = none). Sent as `group_id`. */
+    val groupId: Flow<String> =
+        context.meshDataStore.data.map { it[GROUP_ID] ?: "" }
+
     suspend fun ensureNodeId(): String {
         val current = nodeId.first()
         if (current.isNotBlank()) return current
-        val fresh = UUID.randomUUID().toString()
+        // DataStore empty (fresh install or clear-data): prefer a deterministic
+        // ID derived from ANDROID_ID so a reinstall reuses the same device_id
+        // instead of minting a duplicate row. ANDROID_ID needs no permission,
+        // works offline, and is stable per app-signing-key + device (reset only
+        // on factory reset). Falls back to random UUID when unavailable.
+        val stable = stableIdFromAndroidId()
+        val fresh = stable ?: UUID.randomUUID().toString()
         context.meshDataStore.edit { it[NODE_ID] = fresh }
+        Log.i(TAG, "node_id minted (stable=${stable != null}, id=$fresh)")
+        if (stable == null) {
+            Log.w(TAG, "ANDROID_ID unavailable — minted random node_id; a reinstall may duplicate the coordinator row.")
+        }
         return fresh
     }
+
+    /**
+     * "Use existing ID": adopt a previously issued device_id (e.g. the stale
+     * `RMX3785-realme` row) so the next heartbeat reuses that row instead of
+     * the current UUID. Accepts legacy human-readable IDs as-is. Returns false
+     * when the input is blank (nothing written).
+     */
+    suspend fun setNodeId(raw: String): Boolean {
+        val id = raw.trim()
+        if (id.isBlank()) return false
+        context.meshDataStore.edit { it[NODE_ID] = id }
+        Log.i(TAG, "node_id adopted existing id=$id")
+        return true
+    }
+
+    /** Deterministic UUID from ANDROID_ID, or null when it cannot be read. */
+    private fun stableIdFromAndroidId(): String? = runCatching {
+        val androidId = Settings.Secure
+            .getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+            ?.trim().orEmpty()
+        // 9774d56d682e549c is the well-known broken ANDROID_ID on old emulators.
+        if (androidId.isBlank() || androidId == "9774d56d682e549c") return@runCatching null
+        UUID.nameUUIDFromBytes(("dllm-mesh:$androidId").toByteArray(Charsets.UTF_8)).toString()
+    }.getOrNull()
 
     suspend fun setCoordinatorUrl(url: String) {
         context.meshDataStore.edit { it[COORDINATOR_URL] = url.trim() }
@@ -100,6 +195,11 @@ class IdentityStore(private val context: Context) {
 
     suspend fun setServerNodeId(nodeId: String) {
         context.meshDataStore.edit { it[SERVER_NODE_ID] = nodeId.trim() }
+    }
+
+    /** Remember the active private group (blank clears = no group). */
+    suspend fun setGroupId(id: String) {
+        context.meshDataStore.edit { it[GROUP_ID] = id.trim() }
     }
 
     /** Persist a full pairing result: active server URL + TOFU pin data. */

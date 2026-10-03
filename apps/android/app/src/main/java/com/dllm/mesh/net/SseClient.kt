@@ -85,10 +85,13 @@ class SseClient(
                     type: String?,
                     data: String,
                 ) {
+                    // Contract shapes (contracts/event-log.md): token {"pos","text"},
+                    // commit {"pos"}, status = raw JSON. Legacy pre-fix replay wrapped
+                    // everything as {"kind","payload"} — unwrapped here for rollout.
                     val evt: ChatEvent = when (type?.lowercase()) {
-                        "token", "message", "delta", null, "" -> ChatEvent.Token(data, id)
+                        "token", "message", "delta", null, "" -> ChatEvent.Token(extractText(data), id)
                         "committed", "commit" ->
-                            ChatEvent.Committed(data.trim().toIntOrNull() ?: 0, id)
+                            ChatEvent.Committed(extractPos(data), id)
                         else -> ChatEvent.Status("$type: $data", id)
                     }
                     trySend(evt)
@@ -109,6 +112,57 @@ class SseClient(
             val source = factory.newEventSource(reqBuilder.build(), listener)
             awaitClose { source.cancel() }
         }
+
+    companion object {
+        /**
+         * Parses a `status`-shaped payload for an embedded user turn.
+         * The server broadcasts `user_message` rows as `event: status` with
+         * `data = {"role":"user","text":"..."}`; returns the text, else null.
+         * Used to rebuild cross-device history (phone <-> web) from the
+         * events replay — `session_created` and other statuses return null.
+         */
+        fun extractUserText(data: String): String? {
+            val raw = data.trim()
+            if (!raw.startsWith("{")) return null
+            return try {
+                val obj = JSONObject(raw)
+                val role = obj.optString("role", "")
+                if (!role.equals("user", ignoreCase = true)) return null
+                val text = obj.optString("text")
+                    .ifBlank { obj.optString("content") }
+                    .ifBlank { obj.optString("prompt") }
+                text.ifBlank { null }
+            } catch (_: Exception) { null }
+        }
+
+        /** Extracts `text` from contract `{"pos","text"}`; unwraps legacy `{"kind","payload"}`. */
+        fun extractText(data: String): String {
+            val raw = data.trim()
+            if (!raw.startsWith("{")) return raw
+            return try {
+                val obj = JSONObject(raw)
+                if (obj.has("text")) return obj.optString("text", "")
+                // Legacy: {"kind":"token","payload":"{\"pos\":0,\"text\":\"hi\"}"}
+                if (obj.has("payload")) {
+                    val inner = obj.optString("payload", "")
+                    if (inner.trim().startsWith("{")) {
+                        JSONObject(inner).optString("text", inner)
+                    } else inner
+                } else raw
+            } catch (_: Exception) { raw }
+        }
+
+        /** Extracts `pos` from contract `{"pos"}`; falls back to raw int + legacy wrapper. */
+        fun extractPos(data: String): Int {
+            data.trim().toIntOrNull()?.let { return it }
+            return try {
+                val obj = JSONObject(data)
+                if (obj.has("pos")) obj.optInt("pos", 0)
+                else if (obj.has("payload")) extractPos(obj.optString("payload", "0"))
+                else 0
+            } catch (_: Exception) { 0 }
+        }
+    }
 
     /** POSTs a chat message; returns the raw response body (session echo). */
     suspend fun postMessage(baseUrl: String, sessionId: String, text: String): String =

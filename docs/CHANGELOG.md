@@ -1,5 +1,110 @@
 # Changelog (newest first — append on every change)
 
+## 2026-09-15 — Devices hard-delete + Android stable identity (docs crew)
+
+- Backend: `DELETE /v1/devices/{id}` live (`Store::delete_device` + `dllm-serve::delete_device`) — hard-deletes the registry row so drill junk / stale dupes disappear from `GET /v1/devices`; 200 `{ok:true,id}` / 404 `{ok:false}` unknown / 400 self coordinator (`id == node.node_id`, never orphan the mesh); no broadcast; later heartbeat recreates the row as paired. Test `delete_device_roundtrip_unknown_and_reheartbeat_recreates` green.
+- Android: stable identity — `node_id` is now a deterministic UUID from `ANDROID_ID` (`IdentityStore.ensureNodeId`, reinstall-safe, random-UUID fallback when missing/broken); pairing/scan/manual/nearby flows never rotate it; "Use existing ID" UI (`setNodeId`, Devices + Pairing screens) adopts a prior id so the next heartbeat reuses that row; single shared heartbeat builder (`buildHeartbeatBody`: device_id/role/permissions/device_name).
+- Ops: delete `drill-pixel-8` via `DELETE /v1/devices/{id}`.
+- Contracts: `contracts/openapi.yaml` already carries `deleteDevice` (200/400/404) — verified, no change. Docs: ADR-027; `BUILD_STATUS.md` DELETE row DONE + stable-ID note; `CONNECTIONS.md` E1/E2 DELETE + stable-identity note.
+
+## 2026-09-14 — Fresh debug APK built (Devices overhaul compiled in)
+
+- `assembleDebug` green via cached Gradle 8.9 + Temurin JDK 17 (`LOCALAPPDATA\Programs\temurin17\jdk-17.0.20.1+1`; default Java 25 can't run Gradle 8.9). `compileDebugKotlin` re-ran: grouped Devices lists, Connect presence, Nearby pair requests, revoke fix all in `app-debug.apk` (69.2 MB, 16:57).
+
+## 2026-09-14 — Web: revoked devices get their own section with Approve
+
+- The `N revoked (hidden…)` note was a dead end — revoked rows were never rendered, so re-approving was impossible from the website. New `Revoked` section below Paired reuses `DeviceCard`, whose toggle already renders Approve for revoked rows (`POST …/approve` + fleet reload). Rebuilt `dist/`.
+
+## 2026-09-14 — Devices: grouped lists, Connect, LAN pair requests (app) + fleet auto-refresh (web)
+
+- App Devices (`ui/Devices.kt`): registry parser now keeps the full row (`device_id/device_name/role/status/active/last_seen/paired_at`); list grouped `Active & connected` / `Paired` (revoked sink to bottom, still approvable) with counts — same vocabulary as the website. Tap a row expands inline detail (id, role, status, last seen, paired) + Approve/Revoke. Revoke fixed: was `DELETE /v1/devices/{id}` (no such route → 405), now `POST …/revoke`. Screen scrolls so nothing clips on small phones.
+- Connect (`DevicesViewModel.connectPresence/connectViaPeer`): `POST /v1/devices/heartbeat` as this phone (`role: client`, name = model) now + every 30s while connected; coordinator lists the phone paired+active so the website shows it under Active now. Disconnect stops the loop (idle after ~90s). A row's Connect appears for this phone or for a registry row matching a discovered LAN peer (`node_id` TXT); other idle rows honestly say Connect appears when discovered nearby.
+- Pairing tab (`ui/Pairing.kt`): third method `Nearby` — LAN mDNS scan with per-peer `Send request` (heartbeat announce → that coordinator's website lists the phone) and `Use as server`; discovery stops on Back/clear. QR/Manual/Test untouched.
+- Web (`App.tsx`): fleet quietly re-pulls every 15s while the Devices tab is open (`loadFleet(quiet)` skips the spinner flag), so app connects promote to Active now unaided. `npm run build` green.
+
+## 2026-09-14 — Chat list newest-first (web + Android)
+
+- Server returns sessions oldest-first (`ORDER BY MIN(id) ASC`); both clients now sort newest-first by last activity (`last_token_at` → `created_at`), ChatGPT-style. Active chats jump to top after send. Android auto-open fallback is now the newest (was oldest). No API change, no server restart needed.
+
+## 2026-09-14 — Delete 405 root-caused (stale server) + 405 hardening
+
+- `DELETE /v1/sessions/{id}` → `HTTP 405` was the running `dllm.exe` predating the route: unmatched non-GET methods fall through to the `ServeDir` static fallback, which only speaks GET/HEAD → 405. Rebuilt (`cargo build -p dllm`, 1m44s) and restarted the :8080 server (PID 1100 → 4868); drill on :8099 proved the fresh binary answers `DELETE` with honest 404 `{ok:false}`; live sessions list intact (renames survived restart).
+- Web (`App.tsx`): rename + delete now treat 405 like 404 ("coordinator needs upgrade — state unchanged") so stale servers degrade honestly instead of `Error: HTTP 405`. Rebuilt `dist/`.
+
+## 2026-09-14 — Chat drawer layout fix (vertical-text + overlapping panels)
+
+- Root cause: `.drawer-row` was `display:flex` without `flex-wrap`, while rename/confirm/usage panels declared `flex-basis:100%` — they stayed on the same flex line and crushed the title to ~1 char wide, so `overflow-wrap:anywhere` broke it letter-by-letter. Fix: `flex-wrap:wrap` on the row, full-width panels drop below, title is single-line ellipsis. Rename/delete/usage are now mutually exclusive (opening one closes the others; ⋯ toggle and chat-switch also reset). `npm run build` green.
+- Delete debugging note: if Confirm delete still shows "coordinator needs upgrade", the running `dllm serve` binary predates `DELETE /v1/sessions/{id}` — rebuild + restart the server.
+
+## 2026-09-14 — Chat-overhaul verification crew (backend/web/Android PASS + fixes)
+
+- Verification: 3 parallel crews (backend / web / Android) checked the uncommitted chat overhaul against contracts + UI skills (`frontend-design`, `vercel-react-best-practices`, `typescript-advanced-types`, `compose-state-and-effects`, `compose-performance`, `kotlin-concurrency-and-flow`). All items PASS: header nav (Chat/Models/Devices/Usage), right chat drawer with per-row ⋯ Rename/Delete/Usage, Model-split 28-seg toggle, single-bubble streaming (commit never closes), web+mobile sync via `GET /v1/sessions` + SSE replay, Android Usage tab in bottom nav.
+- Fixes: store title fallback now `continue`s past empty `text`/`content` keys (`crates/dllm-store/src/lib.rs`); Android `Chat.kt`/`Usage.kt` rethrow `CancellationException` in `runCatching.onFailure` so cancelling streams doesn't misreport as stream error.
+- Green: `cargo test -p dllm-store` 5/5, `-p dllm-serve` 11/11 + frame_roundtrip 2/2; `npm run build` green (`index-Bg7h0dpn.js` 281 KB).
+- Known nits (not fixed): web `Space Grotesk`/`Inter` named but not loaded (system fallback); uppercase `.fleet-h`/`.kv dt`; `·`-joined meta strings; 1900-line root component re-renders per token; contract-vs-code `POST /v1/sessions` (200 vs 201) + `POST messages` shape pre-existing mismatches.
+
+## 2026-09-14 — Web chat ChatGPT-style redesign + streaming bubble fix
+
+- Layout (`apps/web/src/App.tsx`, `apps/web/src/index.css`): slim top header holds everything (brand + nav Chat/Models/Devices/Usage + coordinator URL + connection pill + Chats drawer toggle); chat fills the viewport below with a centered thread column and docked composer. Chat list moved to a collapsible RIGHT drawer (New chat button, per-row ⋯ menu); drawer overlays with a backdrop under 900 px. Pipeline side panel (Stage A/B/C + activations hint) removed from the chat tab; the `Stage` type and its state are deleted (`PlanStage` for the Usage tab is untouched). Dropped `@chatscope` components/CSS from the chat tab (own thread/composer divs, existing palette, no gradients, sentence-case copy). Devices/Models/Usage tabs untouched.
+- Drawer rows (`App.tsx`): title from `GET /v1/sessions` `title`, fallback to id prefix + model (`displayTitle` in new `apps/web/src/chatStream.ts`). Row menu: Rename (inline edit → `POST /v1/sessions/{id}/rename`), Delete (inline confirm → `DELETE /v1/sessions/{id}` + drops the local thread), Usage (popover: model, tokens_out, message/event counts, last activity — real fields only, "not reported" otherwise). Both endpoints 404 until the backend crew lands → notice "coordinator needs upgrade — state unchanged", lists and threads left exactly as-is, never crashes.
+- Model split (`App.tsx`): "Model split" toggle in the thread header expands the 28-segment layer strip per device, reusing the Usage tab's parsing (`/v1/usage.plan` ?? `/v1/plan`, `planLayerOwners`, single-device caption); lazy-loads fleet+usage on expand; honest "plan not reported" empty state.
+- Bubble fix (`App.tsx`, `chatStream.ts`): root cause — the server emits one `commit` durability mark PER token and strips `done` from SSE shapes, but the old `commit` handler closed the pending bubble, so every token opened a new bubble ("Hello","!","How can",…). Fix: tokens accumulate into a SINGLE assistant bubble per in-flight response key (`appendToken`), bare `commit` only advances the resume cursor, finalize happens on done/complete events, token-with-done, 2.5 s idle gap, or the next turn. History reload rebuilds one message per turn (replayed `user_message` status rows become "you" bubbles and seal the previous stream; per-session cursors + seen-ids dedupe re-attaches).
+- `npm run build` (tsc strict + vite) green.
+
+## 2026-09-14 — Session rename + delete (web + Android chat sync)
+
+- Store (`crates/dllm-store/src/lib.rs`): new `session_titles(session PK, title, updated_at)` table (created by `SCHEMA_SQL` on every open, so legacy DBs migrate automatically). New methods `session_exists`, `set_session_title` (upsert), `delete_session` (drops the append-only DELETE trigger inside one `BEGIN IMMEDIATE` txn — same pattern as `prune_older_than` — deletes `events WHERE session=?` + the title row, re-creates the trigger, returns existed-bool). `SessionSummary` gains `title: String`; `list_sessions` resolves it per session: `session_titles` row → latest `session_renamed` event `{"title"}` fallback → first `user_message` text (`text`/`content`/`prompt`/`message`, trimmed, Unicode-truncated to 40 chars) → `"New chat"`. Table survives restarts (SQLite) and the 24 h TTL prune (prune only touches `events`); rename also appends a `session_renamed` event so SSE replay carries it.
+- Serve (`crates/dllm-serve/src/lib.rs`): `DELETE /v1/sessions/{id}` (`delete_session`) → 200 `{ok:true,id}` / 404 `{ok:false}` unknown; broadcasts an ephemeral (unstored, id 0) `status {"deleted":true}` tombstone for live SSE. `POST /v1/sessions/{id}/rename` (`rename_session`, body `{title}`) → trims, 400 `{ok:false}` on missing/empty/>80-char, 404 unknown, else persists to the table + appends `session_renamed` + broadcasts (surfaced as SSE `status` via `sse_shape_for_live`) → 200 `{ok:true,id,title}`. `GET /v1/sessions` entries gain `title`. `GET /v1/sessions/{id}/events` now 404s `{ok:false}` for unknown/deleted ids (deleted sessions lose their SSE resume position; `replay_since` is empty post-delete). Tests: `sessions_rename_roundtrip_default_fallback_and_validation` (create → `New chat` → seed long user message → 40-char default → rename trim roundtrip → latest-wins → empty/whitespace/81-char/missing-field 400s → exact-80 ok → unknown 404 → reopen-DB restart survival) and `sessions_delete_removes_from_list_and_events` (2 sessions, rename one, delete → list drops it / sibling keeps `New chat` / replay empty / events 404 / unknown delete+events 404). `cargo test -p dllm-serve` green.
+- Contracts: `contracts/openapi.yaml` gains `DELETE /v1/sessions/{id}` + `POST /v1/sessions/{id}/rename` (400/404 shapes), `SessionSummary.title` (required), events 404.
+
+## 2026-09-14 — Usage-aggregation endpoint for the web Usage tab (`GET /v1/usage`)
+
+- Serve (`crates/dllm-serve/src/lib.rs`): new `GET /v1/usage` (`get_usage`) returning `{tokens_out_total, sessions_total, per_device[], plan:{stages}, bandwidth:null}` — all real data, nulls where unknown. Totals rolled up from the event log via `Store::list_sessions`. Per-device load reuses the exact `device_detail` honest pattern (self → fresh `live_load()` sysinfo = `"live"`; peer with `cpu_pct`+`mem_pct`+`load_updated_at` row = `"reported"`; else `"none"`; nulls when no source). Sessions carry no `device_id` (`SessionSummary` has only `id/model/created_at/tokens_out/last_token_at`), so attribution is the honest fallback: self gets all tokens/sessions (single-device serves all), peers get `tokens_out: 0, sessions: 0`. Layers mirror `/v1/plan` for self (0–27), null for peers. `bandwidth` is explicit null (not measured anywhere yet — never faked). Test: `usage_aggregates_tokens_per_device_plan_and_null_bandwidth` (heartbeat peer w/ load → 2 sessions / 3 tokens → assert totals + per-device live/reported + plan shape + bandwidth null). `cargo test -p dllm-serve`: 9 unit + 2 frame-roundtrip green.
+- Contracts: `contracts/openapi.yaml` gains `/v1/usage` + `Usage` schema.
+
+## 2026-09-14 — Web fleet Approve/Revoke reflects real device status
+
+- Web (`apps/web/src/App.tsx`): `DeviceCard` + `DeviceDetailModal` no longer render both buttons — paired devices (`status === "paired"`, or missing status + active) show an `approved` pill + Revoke only, revoked devices (`status === "revoked"` or `revoked === true`) show Approve only. `mutateDevice`/`loadFleet()` flow unchanged; `npm run build` (tsc + vite) green.
+
+## 2026-09-14 — Web Usage tab (additive, read-only)
+
+- Web (`apps/web/src/App.tsx`, `apps/web/src/index.css`): new `Usage` tab (Chat/Models/Devices untouched) — pure-SVG `tokens_out` donut per device (unattributed sessions labeled `unattributed/coordinator`), 28-segment layer strip from plan stages with single-device caption, per-device CPU/MEM bars only on live/reported load (else `not reporting`), honest `Link bandwidth not yet measured` panel. Data: tries `GET /v1/usage` first (200 + usable `per_device`/`plan` wins), else composes from `/v1/devices` + `/v1/sessions` + `/v1/plan` + per-device detail. `npm run build` green; donut + strip stack under 860 px.
+
+## 2026-09-14 — Web coordinator default follows the serving host (fixes "no coordinator" on LAN)
+
+- Web (`apps/web/src/App.tsx`): coordinator default was hardcoded `http://127.0.0.1:8080`, so any browser on another device (phone, 2nd laptop) showed `no coordinator` + `Model catalog unreachable`. Default is now `window.location.origin` whenever the page is served by `dllm serve` (dev `:5173` still falls back to loopback). Rebuilt `apps/web/dist`; live immediately (ServeDir reads disk, no restart needed — browser hard-refresh required).
+
+## 2026-09-14 — Android pairing rework: options-first + validation + Settings dedup
+
+- Pairing (`ui/Pairing.kt`): options-first flow — `Add a coordinator` with `[Scan QR code] [Enter manually]` buttons opening their own sub-sections (scanner dialog keeps paste fallback; manual form prefilled from saved server, warns on loopback/link-local hosts, `Save` + `Save & Test`). Changed host drops stale TOFU pin/QUIC port. Health errors now cause+fix (unresolvable host / 15 s timeout with `dllm id` 192.168.x hint / refused) instead of raw exceptions. QR scan accepts `host:port` pastes via `splitHostPort`.
+- Net (`net/Pairing.kt`): new `cleanHost/splitHostPort/currentHostPort/hostWarning`; `baseUrlMatches` default port now scheme-aware (https→443).
+- Settings (`ui/Settings.kt`): server editor removed (was a second writer clobbering the pin) → read-only Active-server card (url + short pin + node_id + quic_port) + `Change server in the Pairing tab.` + worker toggle + About/version + scroll.
+- Devices (`ui/Devices.kt`): `friendlyCause` on refresh/approve/revoke + empty-state inviting pairing.
+- Build: `app-debug.apk` rebuilt green (Gradle 8.9 + Temurin JDK 17 user-scope, 2m35s); new strings verified inside classes4.dex.
+
+## 2026-09-14 — Pairing host fix: multi-candidate LAN IPs (kills 172.16.0.2 bug)
+
+- Root cause (from field screenshots): `lan_ipv4()` used the outbound-route trick only, so on a multi-homed laptop it advertised a VPN/PPP address (`172.16.0.2`) while the phone sat on WiFi (`192.168.29.81`) → phone `Test` timed out after 15 s. Web showed the phone paired (heartbeat via USB reverse) but the app could never reach the server over WiFi; Devices list stayed 0.
+- Serve (`crates/dllm-serve/src/lib.rs`): new `lan_candidates()` (hostname resolution = one entry per interface + outbound trick as fallback; drops loopback/unspecified/link-local/multicast; ranks `192.168 > 10 > 172.16 > other`, deduped, std-only + existing `hostname` dep) + `lan_ipv4()` = best pick. `GET /api/pairing-uri` now returns `{uri, candidates, warning?}`.
+- App (`apps/dllm/src/main.rs`): `dllm id` prints `candidates:` line so the operator picks the WiFi IP.
+- Contracts: `contracts/openapi.yaml` `/api/pairing-uri` gains `candidates[]` + `warning`.
+- Tests: all 8 `dllm-serve` unit + 2 frame-roundtrip green.
+- Next (planned): Android pairing UI options-first restructure (QR-scan vs manual sub-sections), host validation + cause+fix errors, Settings dedup; capability-based shard planner already designed (see research).
+
+## 2026-09-14 — Friendly device names + live load + detail endpoint + SSE contract fix
+
+- Store (`crates/dllm-store/src/lib.rs`): `devices` gains `device_name TEXT`, `cpu_pct/mem_pct REAL`, `load_updated_at TEXT`, `capabilities TEXT`; `SCHEMA_SQL` updated + `ensure_device_columns` migration (`ALTER TABLE ... ADD COLUMN` per missing col, legacy DBs migrate on open). New methods `get_device`, `set_device_name`, `set_device_load` (stamps `load_updated_at`), `set_device_capabilities`; `upsert_device` preserves name/load/caps on re-announce. `DeviceRow` loses `Eq` (now has `Option<f64>`). Tests: name/load/caps roundtrip + legacy-migration survival.
+- Serve (`crates/dllm-serve/src/lib.rs`): new deps `hostname 0.4` + `sysinfo 0.30`. `self_device_name()` (OS hostname, fallback node_id); `live_load()` (fresh sysinfo cpu avg + mem %, 100 ms double-sample, never synthesized). `DeviceView` + heartbeat now carry `device_name`; heartbeat persists `device_name`/`load:{cpu_pct,mem_pct}`/`capabilities`. New `GET /v1/devices/{id}` detail: `{device:{...registry incl device_name, cert_fp, capabilities}, load:{live|reported+updated_at|none}, sessions:[self-only], stage:{0-27}|null}`, 404 `{ok:false}` unknown. SSE contract fix: `sse_shape_for_stored/live` emit `token {"pos","text"}` / `commit {"pos"}` / `status` (raw payload) — never `{kind,payload}`; `post_message` appends + broadcasts one `commit` per token (single-device durability); `session_created`/`user_message` broadcast as `status`; `GET .../events` honors `?last_event=K` (plus `lastEventId` alias) with `Last-Event-ID` header fallback; `id:` stays `events.id`. Tests: detail live/reported/none + 404 + sessions/stage attribution, shape mapping never-wrapped.
+- App (`apps/dllm/src/main.rs`): self-seed sets `device_name` via `dllm_serve::self_device_name(&node_id)`.
+- Android (`apps/android/.../net/SseClient.kt`): parser fixed for the contract — `extractText` reads `text` from `{"pos","text"}` (unwraps legacy `{"kind","payload"}` during rollout), `extractPos` reads `pos` from `{"pos"}` (raw-int + legacy fallback). This was the broken-chat root cause (raw JSON appended to the stream).
+- Contracts: `contracts/openapi.yaml` gains `device_name` (nullable, null = client falls back), heartbeat `load`/`capabilities` persisted, `DeviceDetail` (`device/load/sessions/stage`) + `GET /v1/devices/{id}`, corrected SSE (`?last_event`, `token {"pos","text"}` / `commit {"pos"}` / `status`, `id` = events.id).
+
+## 2026-09-14 — Real devices source of truth (SQLite registry + honest endpoints)
+
+- Store: `devices` table (`device_id` PK, role, permissions JSON, cert_fp, status paired|revoked CHECK, paired_at, paired_by, last_seen) in `crates/dllm-store/src/lib.rs`; methods `upsert_device` (preserves status/paired_at/paired_by on re-announce), `touch_last_seen`, `set_status` (bool existed + `InvalidStatus` guard), `list_devices`; `SessionSummary` + `list_sessions` roll-up (model from `session_created` payload or honest `"unknown"`, `tokens_out` = token-kind COUNT, `last_token_at`). Tests: registry roundtrip + sessions roll-up.
+- Serve (`crates/dllm-serve/src/lib.rs`): self-row seeded at `run_serve` startup (coordinator/paired/just-seen, `apps/dllm/src/main.rs`) so count>=1 is real; `/api/health` touches self `last_seen`. New routes: `GET /v1/devices` (self-first, `active` = seen within 90 s, unparseable ts = inactive), `POST /v1/devices/heartbeat` (default role worker, status paired, `{ok:true}`), `POST /v1/devices/{id}/approve|revoke` (`{ok:true}`, 404 honest unknown), `GET /api/pairing-uri` (`{uri}`, canonical `pairing_uri`/`lan_ipv4` moved to dllm-serve — `dllm id` delegates, byte-identical output), `GET /v1/sessions` (event-log feed), `GET /v1/plan` (plan_id 1, self layers 0–27, single-device fast path). Tests: heartbeat→list→revoke→approve roundtrip, sessions/plan/pairing-uri, URI format, ts-window parser.
+- Contracts/docs: `contracts/openapi.yaml` gains `/api/node`, `/api/stats`, `/api/pairing-uri`, heartbeat, sessions list, honest `Device`/`SessionSummary`/`Plan`/`Node` schemas; `BUILD_STATUS.md` + `CONNECTIONS.md` (E1/E2) rows updated.
+
 ## 2026-09-13 — Phase 5 hardening: store TTL/checkpoint, /api/stats, real JNI decode, acceptance harness
 
 - Store retention: `Store::prune_older_than` + `Store::checkpoint` (`PRAGMA wal_checkpoint(TRUNCATE)`) in `crates/dllm-store/src/lib.rs`; tests: WAL recovery replays all events after reopen, backdated prune restores append-only ordering.

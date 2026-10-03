@@ -10,8 +10,11 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.dllm.mesh.data.IdentityStore
+import com.dllm.mesh.net.Presence
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,6 +24,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.io.File
 
@@ -43,7 +47,14 @@ data class WorkerStats(
  * - `com.dllm.mesh.action.STOP_WORKER`  → stopSelf.
  * A null/legacy action is treated as START for backwards compatibility.
  *
- * Phase 5 (NOT here): QUIC inference transport + real llama.cpp sampling.
+ * Phone offload readiness: while running, every heartbeat goes out as
+ * role=worker with load + capabilities{ms_per_layer_decode,kv_pages,layers}
+ * (+ worker_active/group_id/layers) via [Presence], so the backend
+ * `/v1/plan` can assign layers to this phone.
+ *
+ * NOTE: the JNI [LlamaBridge.inferChunk] path is still local-only (sanity
+ * round-trip + token counting). Remote shard execution over QUIC chaining
+ * has NOT landed — no inference traffic leaves the phone yet.
  */
 class WorkerService : Service() {
 
@@ -54,6 +65,7 @@ class WorkerService : Service() {
 
         const val CHANNEL_ID = "dllm_worker"
         const val NOTIF_ID = 1001
+        private const val TAG = "WorkerService"
         private const val WAKE_TAG = "dllm:shard"
         private const val WIFI_TAG = "dllm:worker"
         private const val HEARTBEAT_MS = 30_000L
@@ -131,10 +143,28 @@ class WorkerService : Service() {
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
             probeLocalModel(explicitModelPath)
+            sendWorkerHeartbeat()
             while (true) {
                 delay(HEARTBEAT_MS)
-                updateStats { it.copy(lastHeartbeatEpochMs = System.currentTimeMillis()) }
+                sendWorkerHeartbeat()
             }
+        }
+    }
+
+    /**
+     * Worker lifeline: role=worker heartbeat with load + capabilities so
+     * `/v1/plan` can assign layers. Failures only log — the loop retries on
+     * the next tick and the service keeps running.
+     */
+    private suspend fun sendWorkerHeartbeat() {
+        val tick = runCatching {
+            val base = IdentityStore(applicationContext).coordinatorUrl.first().trimEnd('/')
+            Presence.postHeartbeat(applicationContext, base)
+        }
+        if (tick.isSuccess) {
+            updateStats { it.copy(lastHeartbeatEpochMs = System.currentTimeMillis()) }
+        } else {
+            Log.w(TAG, "worker heartbeat failed: ${tick.exceptionOrNull()?.message}")
         }
     }
 

@@ -6,7 +6,8 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Chat
-import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.PieChart
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
@@ -25,9 +26,10 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.dllm.mesh.ui.ChatScreen
-import com.dllm.mesh.ui.DevicesScreen
+import com.dllm.mesh.ui.NetworksScreen
 import com.dllm.mesh.ui.PairingScreen
 import com.dllm.mesh.ui.SettingsScreen
+import com.dllm.mesh.ui.UsageScreen
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -78,14 +80,14 @@ fun DllmMeshApp() {
                     label = { Text("Chat") },
                 )
                 NavigationBarItem(
-                    selected = route == "devices",
+                    selected = route == "networks",
                     onClick = {
-                        if (route != "devices") {
-                            navController.navigate("devices") { launchSingleTop = true }
+                        if (route != "networks") {
+                            navController.navigate("networks") { launchSingleTop = true }
                         }
                     },
-                    icon = { Icon(Icons.Filled.List, contentDescription = null) },
-                    label = { Text("Devices") },
+                    icon = { Icon(Icons.Filled.Group, contentDescription = null) },
+                    label = { Text("Networks") },
                 )
                 NavigationBarItem(
                     selected = route == "pairing",
@@ -96,6 +98,16 @@ fun DllmMeshApp() {
                     },
                     icon = { Icon(Icons.Filled.QrCodeScanner, contentDescription = null) },
                     label = { Text("Pairing") },
+                )
+                NavigationBarItem(
+                    selected = route == "usage",
+                    onClick = {
+                        if (route != "usage") {
+                            navController.navigate("usage") { launchSingleTop = true }
+                        }
+                    },
+                    icon = { Icon(Icons.Filled.PieChart, contentDescription = null) },
+                    label = { Text("Usage") },
                 )
                 NavigationBarItem(
                     selected = route == "settings",
@@ -116,8 +128,9 @@ fun DllmMeshApp() {
             modifier = Modifier.padding(padding),
         ) {
             composable("chat") { ChatScreen() }
-            composable("devices") { DevicesScreen() }
+            composable("networks") { NetworksScreen() }
             composable("pairing") { PairingScreen() }
+            composable("usage") { UsageScreen() }
             composable("settings") { SettingsScreen() }
         }
     }
