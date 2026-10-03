@@ -44,7 +44,6 @@ class IdentityStore(private val context: Context) {
         private val SERVER_FINGERPRINT = stringPreferencesKey("server_fingerprint")
         private val SERVER_QUIC_PORT = intPreferencesKey("server_quic_port")
         private val SERVER_NODE_ID = stringPreferencesKey("server_node_id")
-        private val GROUP_ID = stringPreferencesKey("group_id")
 
         const val KEYSTORE_ALIAS = "dllm_mesh_signing"
         const val DEFAULT_COORDINATOR_URL = "http://192.168.1.10:8080"
@@ -55,16 +54,19 @@ class IdentityStore(private val context: Context) {
 
         /**
          * Single heartbeat-body builder shared by every sender
-         * (Devices presence, WorkerService, Pairing.sendPairRequest via
-         * [com.dllm.mesh.net.Presence]). Keeps device_id / device_name /
-         * role / permissions from diverging again.
+         * (Devices presence, WorkerService, Pairing.connect).
+         * Keeps device_id / device_name / role / permissions from diverging again.
          *
          * RMX3785 load fix: always emits `load:{cpu_pct,mem_pct}` (0-100,
-         * JSON null when unknown — never synthesized). When this phone
-         * works as a compute worker, callers also pass `capabilities` +
-         * `worker_active=true` + `group_id` + `layers` so the backend
-         * `/v1/plan` can assign layers to it. Unknown fields are ignored by
-         * older coordinators (serde defaults), so this stays compatible.
+         * JSON null when unknown — never synthesized). When this phone works as
+         * a compute worker, callers also pass `capabilities` + `worker_active=true`
+         * + `layers` so the backend `/v1/plan` can assign layers to it. Unknown
+         * fields are ignored by older coordinators (serde defaults), so this stays
+         * compatible.
+         *
+         * There is deliberately no `group_id`: the mesh is a single network, so a
+         * device's membership is expressed by the coordinator's registry row, not
+         * by a group id the phone carries.
          */
         fun buildHeartbeatBody(
             deviceId: String,
@@ -74,7 +76,6 @@ class IdentityStore(private val context: Context) {
             memPct: Double? = null,
             capabilities: JSONObject? = null,
             workerActive: Boolean? = null,
-            groupId: String? = null,
             layers: List<Int>? = null,
         ): String {
             val body = JSONObject()
@@ -90,7 +91,6 @@ class IdentityStore(private val context: Context) {
                 )
             if (capabilities != null) body.put("capabilities", capabilities)
             if (workerActive != null) body.put("worker_active", workerActive)
-            if (!groupId.isNullOrBlank()) body.put("group_id", groupId)
             if (layers != null) body.put("layers", JSONArray(layers))
             return body.toString()
         }
@@ -101,6 +101,18 @@ class IdentityStore(private val context: Context) {
 
     val coordinatorUrl: Flow<String> =
         context.meshDataStore.data.map { it[COORDINATOR_URL] ?: DEFAULT_COORDINATOR_URL }
+
+    /**
+     * True only when a coordinator URL was actually persisted by a pairing flow.
+     *
+     * WHY this is separate from [coordinatorUrl]: that flow substitutes
+     * [DEFAULT_COORDINATOR_URL] on a fresh install, so reading it cannot tell
+     * "paired with 192.168.1.10" from "never paired, showing the placeholder".
+     * Auto-connect on launch needs that distinction, otherwise every first launch
+     * would fire a heartbeat at a placeholder IP and report a scary failure.
+     */
+    val hasCoordinator: Flow<Boolean> =
+        context.meshDataStore.data.map { !it[COORDINATOR_URL].isNullOrBlank() }
 
     val sessionId: Flow<String> =
         context.meshDataStore.data.map { it[SESSION_ID] ?: "" }
@@ -122,10 +134,6 @@ class IdentityStore(private val context: Context) {
     /** node_id last reported by GET /api/node (empty = unknown). */
     val serverNodeId: Flow<String> =
         context.meshDataStore.data.map { it[SERVER_NODE_ID] ?: "" }
-
-    /** Active private-group id selected in Networks (empty = none). Sent as `group_id`. */
-    val groupId: Flow<String> =
-        context.meshDataStore.data.map { it[GROUP_ID] ?: "" }
 
     suspend fun ensureNodeId(): String {
         val current = nodeId.first()
@@ -195,11 +203,6 @@ class IdentityStore(private val context: Context) {
 
     suspend fun setServerNodeId(nodeId: String) {
         context.meshDataStore.edit { it[SERVER_NODE_ID] = nodeId.trim() }
-    }
-
-    /** Remember the active private group (blank clears = no group). */
-    suspend fun setGroupId(id: String) {
-        context.meshDataStore.edit { it[GROUP_ID] = id.trim() }
     }
 
     /** Persist a full pairing result: active server URL + TOFU pin data. */

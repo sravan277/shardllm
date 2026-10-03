@@ -6,27 +6,28 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Chat
-import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.PieChart
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.dllm.mesh.ui.ChatScreen
-import com.dllm.mesh.ui.NetworksScreen
+import com.dllm.mesh.ui.DevicesScreen
+import com.dllm.mesh.ui.DllmMeshTheme
+import com.dllm.mesh.ui.MeshColors
 import com.dllm.mesh.ui.PairingScreen
 import com.dllm.mesh.ui.SettingsScreen
 import com.dllm.mesh.ui.UsageScreen
@@ -42,93 +43,75 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** LAN-signal theme: ink panels, single teal accent, amber reserved for warnings. */
-@Composable
-fun DllmMeshTheme(content: @Composable () -> Unit) {
-    MaterialTheme(
-        colorScheme = darkColorScheme(
-            background = Color(0xFF101418),
-            surface = Color(0xFF171D24),
-            primary = Color(0xFF2DD4BF),
-            secondary = Color(0xFF93A1B0),
-            tertiary = Color(0xFFF5B544),
-            onBackground = Color(0xFFE8EDF2),
-            onSurface = Color(0xFFE8EDF2),
-        ),
-        content = content,
-    )
-}
+/**
+ * One bottom-nav tab. The route doubles as the nav graph destination, so a tab
+ * can never point at a screen that does not exist.
+ */
+private data class MeshTab(
+    val route: String,
+    val label: String,
+    val icon: ImageVector,
+)
+
+/**
+ * Tab order: chat first (it is where the work happens), then the mesh itself,
+ * then the two ways to change it (pair a coordinator, see what it cost), and
+ * settings last. The old Networks tab is gone — the mesh is a single network, so
+ * "Devices" is the only roster there is.
+ */
+private val TABS = listOf(
+    MeshTab("chat", "Chat", Icons.Filled.Chat),
+    MeshTab("devices", "Devices", Icons.Filled.Devices),
+    MeshTab("pairing", "Pairing", Icons.Filled.QrCodeScanner),
+    MeshTab("usage", "Usage", Icons.Filled.PieChart),
+    MeshTab("settings", "Settings", Icons.Filled.Settings),
+)
+
+private const val START_ROUTE = "chat"
 
 @Composable
 fun DllmMeshApp() {
     val navController = rememberNavController()
     val backStack by navController.currentBackStackEntryAsState()
-    val route = backStack?.destination?.route ?: "chat"
+    val route = backStack?.destination?.route ?: START_ROUTE
 
     Scaffold(
-        containerColor = Color(0xFF101418),
+        containerColor = MeshColors.Ink,
         bottomBar = {
-            NavigationBar(containerColor = Color(0xFF171D24)) {
-                NavigationBarItem(
-                    selected = route == "chat",
-                    onClick = {
-                        if (route != "chat") {
-                            navController.navigate("chat") { launchSingleTop = true }
-                        }
-                    },
-                    icon = { Icon(Icons.Filled.Chat, contentDescription = null) },
-                    label = { Text("Chat") },
-                )
-                NavigationBarItem(
-                    selected = route == "networks",
-                    onClick = {
-                        if (route != "networks") {
-                            navController.navigate("networks") { launchSingleTop = true }
-                        }
-                    },
-                    icon = { Icon(Icons.Filled.Group, contentDescription = null) },
-                    label = { Text("Networks") },
-                )
-                NavigationBarItem(
-                    selected = route == "pairing",
-                    onClick = {
-                        if (route != "pairing") {
-                            navController.navigate("pairing") { launchSingleTop = true }
-                        }
-                    },
-                    icon = { Icon(Icons.Filled.QrCodeScanner, contentDescription = null) },
-                    label = { Text("Pairing") },
-                )
-                NavigationBarItem(
-                    selected = route == "usage",
-                    onClick = {
-                        if (route != "usage") {
-                            navController.navigate("usage") { launchSingleTop = true }
-                        }
-                    },
-                    icon = { Icon(Icons.Filled.PieChart, contentDescription = null) },
-                    label = { Text("Usage") },
-                )
-                NavigationBarItem(
-                    selected = route == "settings",
-                    onClick = {
-                        if (route != "settings") {
-                            navController.navigate("settings") { launchSingleTop = true }
-                        }
-                    },
-                    icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
-                    label = { Text("Settings") },
-                )
+            NavigationBar(containerColor = MeshColors.Panel) {
+                TABS.forEach { tab ->
+                    NavigationBarItem(
+                        selected = route == tab.route,
+                        onClick = {
+                            if (route == tab.route) return@NavigationBarItem
+                            // popUpTo(start) + saveState keeps ONE entry per tab
+                            // instead of appending a new copy on every tap, and
+                            // restoreState puts each tab back where the user left
+                            // it. Without this the back stack grew without bound
+                            // and Back walked through every tab visit in reverse
+                            // rather than stepping back through the tabs.
+                            navController.navigate(tab.route) {
+                                popUpTo(navController.graph.findStartDestination().id) {
+                                    saveState = true
+                                }
+                                launchSingleTop = true
+                                restoreState = true
+                            }
+                        },
+                        icon = { Icon(tab.icon, contentDescription = null) },
+                        label = { Text(tab.label) },
+                    )
+                }
             }
         },
     ) { padding ->
         NavHost(
             navController = navController,
-            startDestination = "chat",
+            startDestination = START_ROUTE,
             modifier = Modifier.padding(padding),
         ) {
             composable("chat") { ChatScreen() }
-            composable("networks") { NetworksScreen() }
+            composable("devices") { DevicesScreen() }
             composable("pairing") { PairingScreen() }
             composable("usage") { UsageScreen() }
             composable("settings") { SettingsScreen() }

@@ -16,11 +16,12 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 dllm-core = { path = "../dllm-core" }
 dllm-store = { path = "../dllm-store" }
+# mTLS QUIC mesh: `spawn_mesh_server` binds 8443 and accepts paired peers, and
+# `PeerLink` holds a live `quinn::Connection`, so this is no longer test-only.
+dllm-net = { path = "../dllm-net" }
+quinn = { workspace = true }
 hostname = { workspace = true }
 sysinfo = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-# Wire-format property tests live here because dllm-net itself is
-# off-limits to edits in this change.
-dllm-net = { path = "../dllm-net" }

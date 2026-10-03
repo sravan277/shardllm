@@ -3,6 +3,7 @@ package com.dllm.mesh.net
 import android.app.ActivityManager
 import android.content.Context
 import com.dllm.mesh.data.IdentityStore
+import com.dllm.mesh.data.ModelTopology
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
@@ -18,13 +19,13 @@ import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 
 /**
- * Shared LAN presence infra (moved out of the removed Devices tab).
+ * Shared LAN presence infra: the one place a device announces itself.
  *
- * Every heartbeat sender — Networks presence toggle, [com.dllm.mesh.worker.WorkerService],
- * Pairing "send request" — funnels through [postHeartbeat], which reads the
- * worker toggle + active group and builds the body with
- * [IdentityStore.buildHeartbeatBody]. Role is `worker` when the compute-worker
- * toggle is on, else `client`. node_id is never rotated here (only ensured).
+ * Every heartbeat sender — Devices presence, [com.dllm.mesh.worker.WorkerService],
+ * Pairing's connect/reconnect — funnels through [postHeartbeat], which reads the
+ * compute-worker toggle and builds the body with
+ * [IdentityStore.buildHeartbeatBody]. Role is `worker` when the toggle is on,
+ * else `client`. node_id is never rotated here (only ensured).
  */
 object Presence {
 
@@ -34,15 +35,14 @@ object Presence {
         .build()
 
     /**
-     * Announce this phone to a coordinator registry (auto-creates the paired
-     * row). Throws on transport/HTTP error; callers translate with
+     * Announce this phone to a coordinator registry (upserts the paired row).
+     * Throws on transport/HTTP error; callers translate with
      * [friendlyCause].
      */
     suspend fun postHeartbeat(appContext: Context, base: String) {
         val store = IdentityStore(appContext)
         val id = store.ensureNodeId()
         val workerOn = store.workerEnabled.first()
-        val group = store.groupId.first().ifBlank { null }
         val (cpu, mem) = DeviceLoad.sample(appContext)
         val caps = if (workerOn) WorkerCapabilities.build() else null
         val layers = if (workerOn) WorkerCapabilities.offeredLayers() else null
@@ -53,7 +53,6 @@ object Presence {
             memPct = mem,
             capabilities = caps,
             workerActive = if (workerOn) true else null,
-            groupId = group,
             layers = layers,
         ).toRequestBody("application/json; charset=utf-8".toMediaType())
         val req = Request.Builder()
@@ -124,18 +123,36 @@ object DeviceLoad {
 /**
  * Worker capability advertisement for `/v1/plan` layer assignment.
  *
- * Values are conservative phone-CPU estimates until the real per-layer
- * bench lands: `ms_per_layer_decode` ≈ measured single-thread decode cost,
- * `kv_pages` = KV cache pages this phone can hold, `layers` = total layers
- * of the served model (28 = Qwen3-0.6B shape; mirrored by [offeredLayers]).
+ * The three fields are NOT all the same kind of truth, and the split is
+ * deliberate so the planner can tell them apart:
+ *
+ * - `layers` — a property of the served model, not of this phone. Read from
+ *   [ModelTopology], so it can never disagree with the ranges the UI renders.
+ * - `ms_per_layer_decode` — **PLACEHOLDER.** The honest number would be a
+ *   measured per-layer decode cost from llama.cpp on this exact device; the JNI
+ *   bridge returns decoded *text* only ([com.dllm.mesh.worker.LlamaBridge.inferChunk]),
+ *   so no timing is available to report. The planner weights layers by this
+ *   figure, so the constant biases assignment until real calibration lands
+ *   (`POST /v1/devices/{id}/calibrate`). It is a constant on purpose: a
+ *   fabricated measurement would be worse than a labelled estimate.
+ * - `kv_pages` — **PLACEHOLDER.** True KV capacity depends on the loaded model's
+ *   per-layer head count and the memory actually left after Android's own
+ *   overhead; neither is readable from here without loading the model. Kept as a
+ *   conservative fixed value.
  */
 object WorkerCapabilities {
 
     fun build(): JSONObject = JSONObject()
-        .put("ms_per_layer_decode", 35.0)
-        .put("kv_pages", 256)
-        .put("layers", 28)
+        .put("ms_per_layer_decode", MS_PER_LAYER_DECODE_PLACEHOLDER)
+        .put("kv_pages", KV_PAGES_PLACEHOLDER)
+        .put("layers", ModelTopology.TOTAL_LAYERS)
 
-    /** Layer range this worker offers today: the full single-device 0–27. */
-    fun offeredLayers(): List<Int> = (0..27).toList()
+    /** Layer range this worker offers today: the full single-device span. */
+    fun offeredLayers(): List<Int> = ModelTopology.allLayers()
+
+    /** PLACEHOLDER — see the class KDoc. Not a measurement of this phone. */
+    private const val MS_PER_LAYER_DECODE_PLACEHOLDER = 35.0
+
+    /** PLACEHOLDER — see the class KDoc. Not a measurement of this phone. */
+    private const val KV_PAGES_PLACEHOLDER = 256
 }

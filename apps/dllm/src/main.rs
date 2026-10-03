@@ -76,7 +76,9 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_serve(port: u16) -> anyhow::Result<()> {
     // Stable node identity: load-or-generate persistent Quinn Identity.
-    let (_identity, node_id, fingerprint) = load_or_create_identity()?;
+    // It is NOT just advertised any more — the mesh server below binds it to
+    // QUIC 8443 so paired peers can complete an mTLS handshake.
+    let (identity, node_id, fingerprint) = load_or_create_identity()?;
     tracing::info!(%node_id, %fingerprint, "stable node identity loaded");
     let node = dllm_serve::NodeInfo {
         node_id: node_id.clone(),
@@ -120,7 +122,33 @@ async fn run_serve(port: u16) -> anyhow::Result<()> {
             Arc::new(dllm_core::MockEngine::new())
         }
     };
-    let state = dllm_serve::new_state_with_node_and_port(engine, store.clone(), node, port);
+    // Bind the real mTLS QUIC mesh BEFORE axum::serve: the advertised
+    // quic_port must be a live socket, and /v1/mesh must report real links.
+    // A bind failure is logged and swallowed on purpose — single-device chat
+    // never needs the mesh, so it must not stop the HTTP server booting.
+    let mesh = dllm_serve::mesh::MeshState::new();
+    let _mesh_handle = dllm_serve::mesh::spawn_mesh_server(
+        identity,
+        dllm_serve::QUIC_PORT,
+        store.clone(),
+        mesh.clone(),
+    );
+    let bound = mesh.bound_port();
+    if bound == 0 {
+        tracing::error!(
+            port = dllm_serve::QUIC_PORT,
+            "QUIC mesh not listening (bind failed); serving HTTP only"
+        );
+    } else {
+        tracing::info!(
+            port = bound,
+            allowed_peers = mesh.allowed_peer_count(),
+            "QUIC mesh listening on 0.0.0.0:{bound} (paired peers only)"
+        );
+    }
+
+    // Share the same MeshState with the API so GET /v1/mesh + /api/stats see it.
+    let state = dllm_serve::new_state_with_mesh(engine, store.clone(), node, port, mesh);
     dllm_serve::spawn_maintenance(store, dllm_serve::DEFAULT_EVENT_TTL_SECS);
     let app = dllm_serve::router(state);
 

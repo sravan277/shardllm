@@ -28,7 +28,14 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.io.File
 
-/** Snapshot of worker health. Observed by UI via [WorkerService.stats] (no binding). */
+/**
+ * Snapshot of worker health. Observed by UI via [WorkerService.stats] (no binding).
+ *
+ * [lastHeartbeatEpochMs] is the liveness signal, NOT [running]/[ready]: stats
+ * live in a static field, so a value written just before the OS killed the
+ * service would otherwise still read "Ready" afterwards. Freshness of the last
+ * heartbeat is the only evidence that survives that scenario.
+ */
 data class WorkerStats(
     val running: Boolean = false,
     val modelLoaded: Boolean = false,
@@ -42,15 +49,20 @@ data class WorkerStats(
 /**
  * Phase 4 worker: foreground service (type connectedDevice) + JNI stub.
  *
- * Intent contract (owned here; sibling Settings toggle calls [start]/[stop]):
+ * Intent contract (owned here; the sibling Devices tab toggle calls [start]/[stop]):
  * - `com.dllm.mesh.action.START_WORKER` → foreground + probe local GGUF + heartbeat.
- * - `com.dllm.mesh.action.STOP_WORKER`  → stopSelf.
+ * - `com.dllm.mesh.action.STOP_WORKER`  → stopSelf().
  * A null/legacy action is treated as START for backwards compatibility.
  *
  * Phone offload readiness: while running, every heartbeat goes out as
  * role=worker with load + capabilities{ms_per_layer_decode,kv_pages,layers}
- * (+ worker_active/group_id/layers) via [Presence], so the backend
- * `/v1/plan` can assign layers to this phone.
+ * (+ worker_active + layers) via [Presence], so the backend `/v1/plan` can
+ * assign layers to this phone.
+ *
+ * Liveness: every heartbeat tick refreshes [WorkerStats.lastHeartbeatEpochMs];
+ * [isLive] combines that freshness with `running`/`ready` so the UI cannot show
+ * a stale "Ready" for a service the OS has already killed.
+
  *
  * NOTE: the JNI [LlamaBridge.inferChunk] path is still local-only (sanity
  * round-trip + token counting). Remote shard execution over QUIC chaining
@@ -96,6 +108,35 @@ class WorkerService : Service() {
         internal fun updateStats(block: (WorkerStats) -> WorkerStats) {
             _stats.value = block(_stats.value)
         }
+
+        /**
+         * How long a worker heartbeat may go unconfirmed before the UI stops
+         * calling the worker live. Matches the coordinator's own 90s device
+         * activity window, so the phone and the registry agree on when a device
+         * counts as gone.
+         */
+        const val LIVENESS_WINDOW_MS = 90_000L
+
+        /**
+         * True only when the worker is genuinely live right now: running, model
+         * probe passed, AND the last heartbeat is inside [LIVENESS_WINDOW_MS].
+         *
+         * WHY heartbeat freshness is part of the test: [WorkerStats] is a static
+         * field. If the service is killed the UI can still be holding a
+         * `ready = true` snapshot, and "Ready" would be a lie until something
+         * else rewrote it. A worker that has not confirmed itself within the
+         * window is treated as dead — the honest, conservative direction.
+         */
+        fun isLive(stats: WorkerStats, nowMs: Long = System.currentTimeMillis()): Boolean =
+            stats.running &&
+                stats.ready &&
+                stats.lastHeartbeatEpochMs > 0L &&
+                (nowMs - stats.lastHeartbeatEpochMs) <= LIVENESS_WINDOW_MS
+
+        /** Seconds since the last confirmed worker heartbeat, or null if never. */
+        fun heartbeatAgeSeconds(stats: WorkerStats, nowMs: Long = System.currentTimeMillis()): Long? =
+            if (stats.lastHeartbeatEpochMs <= 0L) null
+            else ((nowMs - stats.lastHeartbeatEpochMs) / 1000L).coerceAtLeast(0L)
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)

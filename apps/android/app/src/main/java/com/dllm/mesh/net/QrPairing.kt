@@ -29,7 +29,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
@@ -37,6 +36,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
+import com.dllm.mesh.ui.MeshColors
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import org.json.JSONObject
@@ -80,14 +80,14 @@ fun parseJoinPayload(raw: String): JoinPayload? = runCatching {
 @Composable
 fun QrShowScreen(payload: String, modifier: Modifier = Modifier) {
     Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
-        Text("Show this to a new device", color = Color(0xFFE8EDF2))
+        Text("Show this to a new device", color = MeshColors.Text)
         Spacer(Modifier.height(8.dp))
-        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF171D24))) {
+        Card(colors = CardDefaults.cardColors(containerColor = MeshColors.Panel)) {
             SelectionContainer {
                 Text(
                     text = payload,
                     modifier = Modifier.padding(16.dp),
-                    color = Color(0xFF2DD4BF),
+                    color = MeshColors.Teal,
                     fontFamily = FontFamily.Monospace,
                 )
             }
@@ -95,7 +95,7 @@ fun QrShowScreen(payload: String, modifier: Modifier = Modifier) {
         Spacer(Modifier.height(8.dp))
         Text(
             "QR bitmap lands in Phase 3. Until then, copy this text to the joining device.",
-            color = Color(0xFF93A1B0),
+            color = MeshColors.Muted,
         )
     }
 }
@@ -155,7 +155,7 @@ fun QrScanScreen(
     }
 
     Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
-        Text("Scan coordinator code", color = Color(0xFFE8EDF2))
+        Text("Scan coordinator code", color = MeshColors.Text)
         Spacer(Modifier.height(8.dp))
         Box(modifier = Modifier.fillMaxWidth().height(320.dp)) {
             AndroidView(

@@ -49,8 +49,9 @@ use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ALPN, FRAME_MAGIC, MAX_FRAME_BYTES, Ack, ActivationFrame, NetError, decode_frame,
-    dev_identity, encode_frame,
+    ACK_HEADER_LEN, ACK_MAGIC, ALPN, Ack, ActivationFrame, FRAME_HEADER_LEN, MAX_ACK_BYTES,
+    MAX_PAYLOAD_BYTES, NetError, decode_ack, decode_frame_header, dev_identity, encode_ack,
+    encode_frame,
 };
 
 /// Highest priority: plan/commit control traffic. Served before all else.
@@ -63,9 +64,6 @@ pub const ACTIVATION_PRIORITY: i32 = 0;
 /// Max queued frames between the QUIC recv loop and the consumer.
 /// See module docs for the backpressure policy.
 pub const FRAME_QUEUE_CAPACITY: usize = 4;
-
-/// Bytes of framing overhead per message on a stream: `MAGIC(5) + u32-LE len`.
-const HEADER_LEN: usize = 5 + 4;
 
 /// Errors from the mTLS transport layer.
 #[derive(Debug, thiserror::Error)]
@@ -383,6 +381,27 @@ pub async fn connect(
     Ok(conn)
 }
 
+/// TOFU fingerprint (`sha256(cert_der)`, lowercase hex) of the certificate
+/// the peer actually presented on `conn`.
+///
+/// [`PinnedClients`] compares exactly this value against its allow-list, so a
+/// server that only receives `incoming.await` knows *that* a peer passed but
+/// not *who* it was. [`quinn::Connection::peer_identity`] carries the rustls
+/// session's negotiated chain (`Vec<CertificateDer>`, end-entity first), which
+/// lets the accept loop resolve the accepted connection back to a registry
+/// row without re-reading the wire.
+///
+/// Returns `None` when the crypto session exposes no certificate chain (a
+/// non-rustls session) or the chain is empty. Callers MUST treat `None` as
+/// "unknown peer" and close the connection — never as a match.
+pub fn peer_fingerprint(conn: &quinn::Connection) -> Option<String> {
+    let identity = conn.peer_identity()?;
+    let certs = identity
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok()?;
+    Some(Identity::fingerprint_of(certs.first()?.as_ref()))
+}
+
 /// Open a tagged bidirectional stream of `kind` and set its Quinn send
 /// priority ([`StreamKind::priority`]). The opener should transmit first
 /// (quinn only notifies the peer of a stream once it carries data).
@@ -420,70 +439,61 @@ pub async fn send_frame(
 }
 
 /// Receive one [`ActivationFrame`] framed by [`send_frame`].
-/// The declared length is checked against the 8 MiB cap *before* allocating;
-/// violations error without unbounded allocation.
+///
+/// Reads the fixed 40-byte header, validates magic + the edge invariants +
+/// the declared payload length against the 8 MiB cap, and only then allocates
+/// the payload. A hostile or corrupt peer therefore cannot force an
+/// unbounded allocation.
 pub async fn recv_frame(
     recv: &mut quinn::RecvStream,
 ) -> Result<ActivationFrame, TransportError> {
-    let mut header = [0u8; HEADER_LEN];
+    let mut header = [0u8; FRAME_HEADER_LEN];
     recv.read_exact(&mut header).await?;
-    if header[..FRAME_MAGIC.len()] != FRAME_MAGIC[..] {
-        return Err(TransportError::Net(NetError::BadMagic));
-    }
-    let mut len_buf = [0u8; 4];
-    len_buf.copy_from_slice(&header[FRAME_MAGIC.len()..HEADER_LEN]);
-    let declared = u32::from_le_bytes(len_buf) as usize;
-    if HEADER_LEN + declared > MAX_FRAME_BYTES {
-        return Err(TransportError::Net(NetError::TooLarge(
-            HEADER_LEN + declared,
-        )));
-    }
-    let mut full = vec![0u8; HEADER_LEN + declared];
-    full[..HEADER_LEN].copy_from_slice(&header);
+    let hdr = decode_frame_header(&header)?;
+    let declared = hdr.payload_length as usize;
+    // decode_frame_header already bounds `declared`; re-checked here so the
+    // invariant is local to the allocation.
+    debug_assert!(declared <= MAX_PAYLOAD_BYTES);
+    let mut payload = vec![0u8; declared];
     if declared > 0 {
-        recv.read_exact(&mut full[HEADER_LEN..]).await?;
+        recv.read_exact(&mut payload).await?;
     }
-    Ok(decode_frame(&full)?)
+    let mut frame = hdr.as_frame();
+    frame.payload = payload;
+    Ok(frame)
 }
 
-/// Send one [`Ack`] with the same `MAGIC + u32-LE len + postcard` framing
-/// (8 MiB cap enforced; ACKs are tiny in practice).
+/// Send one [`Ack`] as `ACK1 || u32-LE len || {"ack":…}`.
+///
+/// ACKs carry their own magic (`ACK1`), so they can never be confused with an
+/// activation frame even if both appear on the same stream.
 pub async fn send_ack(send: &mut quinn::SendStream, ack: &Ack) -> Result<(), TransportError> {
-    let body = postcard::to_allocvec(ack).map_err(NetError::Postcard)?;
-    if HEADER_LEN + body.len() > MAX_FRAME_BYTES {
-        return Err(TransportError::Net(NetError::TooLarge(
-            HEADER_LEN + body.len(),
-        )));
-    }
-    let mut out = Vec::with_capacity(HEADER_LEN + body.len());
-    out.extend_from_slice(FRAME_MAGIC);
-    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    out.extend_from_slice(&body);
-    send.write_all(&out).await?;
+    let bytes = encode_ack(ack)?;
+    send.write_all(&bytes).await?;
     Ok(())
 }
 
-/// Receive one [`Ack`] framed by [`send_ack`]; length is cap-checked before
-/// allocating, mirroring [`recv_frame`].
+/// Receive one [`Ack`] framed by [`send_ack`]; the declared length is
+/// cap-checked against [`MAX_ACK_BYTES`] before the body is read.
 pub async fn recv_ack(recv: &mut quinn::RecvStream) -> Result<Ack, TransportError> {
-    let mut header = [0u8; HEADER_LEN];
+    let mut header = [0u8; ACK_HEADER_LEN];
     recv.read_exact(&mut header).await?;
-    if header[..FRAME_MAGIC.len()] != FRAME_MAGIC[..] {
+    if header[..ACK_MAGIC.len()] != ACK_MAGIC[..] {
         return Err(TransportError::Net(NetError::BadMagic));
     }
-    let mut len_buf = [0u8; 4];
-    len_buf.copy_from_slice(&header[FRAME_MAGIC.len()..HEADER_LEN]);
-    let declared = u32::from_le_bytes(len_buf) as usize;
-    if HEADER_LEN + declared > MAX_FRAME_BYTES {
-        return Err(TransportError::Net(NetError::TooLarge(
-            HEADER_LEN + declared,
-        )));
+    let declared =
+        u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    if declared > MAX_ACK_BYTES {
+        return Err(TransportError::Net(NetError::AckTooLarge(declared)));
     }
     let mut body = vec![0u8; declared];
     if declared > 0 {
         recv.read_exact(&mut body).await?;
     }
-    postcard::from_bytes::<Ack>(&body).map_err(|e| TransportError::Net(NetError::Postcard(e)))
+    let mut full = Vec::with_capacity(ACK_HEADER_LEN + body.len());
+    full.extend_from_slice(&header);
+    full.extend_from_slice(&body);
+    decode_ack(&full).map_err(TransportError::Net)
 }
 
 /// Bounded queue between the QUIC recv loop and the frame consumer.
@@ -534,7 +544,13 @@ mod tests {
         }
     }
 
-    async fn paired() -> (quinn::Endpoint, quinn::Connection, quinn::Connection) {
+    async fn paired_with_ids() -> (
+        quinn::Endpoint,
+        quinn::Connection,
+        quinn::Connection,
+        Identity,
+        Identity,
+    ) {
         let server_id = Identity::generate().unwrap();
         let client_id = Identity::generate().unwrap();
         let server_fp = server_id.fingerprint();
@@ -556,7 +572,94 @@ mod tests {
                     .expect("handshake")
             }
         );
-        (server_ep, client_conn.unwrap(), server_conn)
+        (
+            server_ep,
+            client_conn.unwrap(),
+            server_conn,
+            server_id,
+            client_id,
+        )
+    }
+
+async fn paired() -> (quinn::Endpoint, quinn::Connection, quinn::Connection) {
+        let (server_ep, client_conn, server_conn, _, _) = paired_with_ids().await;
+        (server_ep, client_conn, server_conn)
+    }
+
+    /// Drive one server-side handshake attempt the way production does
+    /// (`dllm_serve::mesh::run_mesh_server`): take the attempt off
+    /// [`quinn::Endpoint::accept`], then await the yielded
+    /// [`quinn::Incoming`].
+    ///
+    /// Both halves are mandatory. `Endpoint::accept()` only *queues* the
+    /// attempt (quinn pushes it onto `RecvState::incoming`); the server's first
+    /// flight is not produced until the `Incoming` is consumed, because that is
+    /// where `EndpointInner::accept` — the call that runs the rustls handshake
+    /// and therefore [`PinnedClients`] — actually happens. A test that merely
+    /// holds an `Incoming` open without awaiting it never gets a response, so
+    /// its peer blocks until quinn's 30 s default idle timeout fires and the
+    /// handshake dies with `ConnectionError::TimedOut`. That is worse than a
+    /// hang for a rejection test, since a timeout is an `Err` as well: the
+    /// assertion would pass without `PinnedClients` ever being consulted.
+    async fn accept_once(ep: &quinn::Endpoint) -> Result<quinn::Connection, quinn::ConnectionError> {
+        ep.accept().await.expect("endpoint open").await
+    }
+
+    /// Assert the server refused the attempt in its certificate verifier.
+    ///
+    /// Only [`quinn::ConnectionError::TransportError`] (a rustls alert) counts.
+    /// In particular [`quinn::ConnectionError::TimedOut`] does not: that is what
+    /// a peer sees when the server never consumed its `Incoming`, so tolerating
+    /// it would let a broken accept path masquerade as a working TOFU refusal.
+    fn assert_rejected_by_verifier(
+        who: &str,
+        outcome: Result<quinn::Connection, quinn::ConnectionError>,
+    ) {
+        match outcome {
+            Err(quinn::ConnectionError::TransportError(_)) => {}
+            Err(other) => panic!(
+                "{who} was refused, but not by the certificate verifier: {other:?} \
+                 (a timeout here means the server never consumed its Incoming)"
+            ),
+            Ok(_) => panic!("{who} completed a handshake against a server that must refuse it"),
+        }
+    }
+
+    /// Assert the refusing side is observable from the rejected peer as well.
+    ///
+    /// TLS 1.3 orders messages so the client can finish its own handshake
+    /// before the server has validated the client certificate, so `connect`
+    /// legitimately resolves `Ok` here even though the peer is being turned
+    /// away. The refusal lands a moment later as a `CONNECTION_CLOSE`; waiting
+    /// for it (bounded) is what distinguishes "refused" from "quietly dropped",
+    /// without letting a regression park the test on a 30 s idle timeout.
+    async fn await_peer_rejection(who: &str, conn: &quinn::Connection) {
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{who} kept its connection open: it was admitted, not rejected")
+            });
+        assert!(
+            !matches!(closed, quinn::ConnectionError::TimedOut),
+            "{who} was rejected only by an idle timeout, not by the server: {closed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_fingerprint_reports_the_negotiated_peer_cert() {
+        let (server_ep, client_conn, server_conn, server_id, client_id) = paired_with_ids().await;
+
+        // Each side must recover exactly the value PinnedClients/PinnedServer
+        // pinned, so an accept loop can map a connection back to a device row.
+        assert_eq!(peer_fingerprint(&server_conn).as_deref(), Some(client_id.fingerprint().as_str()));
+        assert_eq!(peer_fingerprint(&client_conn).as_deref(), Some(server_id.fingerprint().as_str()));
+        // Fingerprints are 64 lowercase hex chars (sha256).
+        let fp = peer_fingerprint(&server_conn).unwrap();
+        assert_eq!(fp.len(), 64);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+        client_conn.close(0u32.into(), b"done");
+        server_ep.close(0u32.into(), b"done");
     }
 
     #[tokio::test]
@@ -611,9 +714,29 @@ mod tests {
         let port = server_ep.local_addr().unwrap().port();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
-        // Wrong expected fingerprint: client-side TOFU check must fail.
+        // Wrong expected fingerprint: client-side TOFU check must fail. The
+        // server must consume the `Incoming` concurrently, otherwise it never
+        // sends its certificate and `connect` fails with `TimedOut` rather than
+        // with the `PinnedServer` rejection this test is about.
         let wrong_fp = Identity::generate().unwrap().fingerprint();
-        assert!(connect(&client_id, addr, &wrong_fp).await.is_err());
+        let (client, server_side) = tokio::join!(
+            connect(&client_id, addr, &wrong_fp),
+            accept_once(&server_ep)
+        );
+        let client_err = match client {
+            Err(e) => e,
+            Ok(_) => panic!("client accepted a server whose fingerprint is not the pinned one"),
+        };
+        assert!(
+            !matches!(
+                client_err,
+                TransportError::Connection(quinn::ConnectionError::TimedOut)
+            ),
+            "client refusal must come from the pinned-fingerprint check, not a \
+             missing server flight: {client_err:?}"
+        );
+        // The server learns of the refusal only as the client's TLS alert.
+        assert!(server_side.is_err(), "server handshake should not succeed");
 
         server_ep.close(0u32.into(), b"done");
     }
@@ -623,17 +746,71 @@ mod tests {
         let server_id = Identity::generate().unwrap();
         let rogue_id = Identity::generate().unwrap();
 
-        // Server allows nobody: rogue client handshake must fail.
+        // Server allows nobody: rogue client handshake must fail. Both ends are
+        // driven, so the failure is `PinnedClients` rejecting the certificate
+        // rather than the rogue simply never getting a reply.
         let server_ep = server(&server_id, 0, HashSet::new()).unwrap();
         let port = server_ep.local_addr().unwrap().port();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
-        assert!(
-            connect(&rogue_id, addr, &server_id.fingerprint())
-                .await
-                .is_err()
+        let server_fp = server_id.fingerprint();
+        let (rogue, server_side) = tokio::join!(
+            connect(&rogue_id, addr, &server_fp),
+            accept_once(&server_ep)
+        );
+        assert_rejected_by_verifier("rogue", server_side);
+        if let Ok(conn) = rogue {
+            await_peer_rejection("rogue", &conn).await;
+        }
+
+        server_ep.close(0u32.into(), b"done");
+    }
+
+    #[tokio::test]
+    async fn tofu_rejects_unknown_client_while_others_are_allowed() {
+        // The production allow-list is built from the device registry, so it is
+        // normally non-empty: an unlisted peer must still be refused while a
+        // listed peer is connected on the same endpoint.
+        let server_id = Identity::generate().unwrap();
+        let allowed_id = Identity::generate().unwrap();
+        let stranger_id = Identity::generate().unwrap();
+
+        let mut allowed = HashSet::new();
+        allowed.insert(allowed_id.fingerprint());
+        let server_ep = server(&server_id, 0, allowed).unwrap();
+        let port = server_ep.local_addr().unwrap().port();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let server_fp = server_id.fingerprint();
+
+        // A listed peer gets in. `accept_once` must run *concurrently* with the
+        // client connect: the server cannot produce its first flight until the
+        // `Incoming` is awaited, and awaiting it only after the `join!` resolves
+        // would deadlock both ends until quinn's idle timeout.
+        let (allowed_conn, allowed_side) = tokio::join!(
+            connect(&allowed_id, addr, &server_fp),
+            accept_once(&server_ep)
+        );
+        let allowed_conn = allowed_conn.expect("listed peer connects");
+        let allowed_side = allowed_side.expect("listed peer handshake");
+        assert_eq!(
+            peer_fingerprint(&allowed_side).as_deref(),
+            Some(allowed_id.fingerprint().as_str())
         );
 
+        // An unlisted peer on the same endpoint must not. The server has to take
+        // this attempt off `Endpoint::accept()` too, otherwise `PinnedClients`
+        // never runs and the stranger would merely time out — an `Err` that would
+        // satisfy the assertion without proving the allow-list rejected it.
+        let (stranger_conn, stranger_side) = tokio::join!(
+            connect(&stranger_id, addr, &server_fp),
+            accept_once(&server_ep)
+        );
+        // The refusal is observable on the server side, where the allow-list
+        // lives: `PinnedClients::verify_client_cert` returned `UnknownIssuer`.
+        assert_rejected_by_verifier("stranger", stranger_side);
+        await_peer_rejection("stranger", &stranger_conn.expect("stranger handshake")).await;
+
+        allowed_conn.close(0u32.into(), b"done");
         server_ep.close(0u32.into(), b"done");
     }
 

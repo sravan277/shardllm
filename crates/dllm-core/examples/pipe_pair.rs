@@ -185,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
         token_position: 0,
         source_stage: 0,
         target_stage: 1,
-        tensor_format: tensor_format::U8_BYTES,
+        tensor_format: tensor_format::RAW,
         payload: plan_bytes,
     };
     timeout_of(send_frame(&mut c_send, &plan_frame), "coord send plan frame").await;

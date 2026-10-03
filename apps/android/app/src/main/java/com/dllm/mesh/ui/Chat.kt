@@ -48,7 +48,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.AndroidViewModel
@@ -58,6 +57,8 @@ import com.dllm.mesh.data.ChatLocalStore
 import com.dllm.mesh.data.IdentityStore
 import com.dllm.mesh.data.LocalChatMsg
 import com.dllm.mesh.data.LocalChatSession
+import com.dllm.mesh.data.coversWholeModel
+import com.dllm.mesh.data.layerRangeText
 import com.dllm.mesh.net.ChatEvent
 import com.dllm.mesh.net.ChatSession
 import com.dllm.mesh.net.DllmApi
@@ -198,11 +199,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             runCatching {
                 val base = store.coordinatorUrl.first()
                 // Prefer usage.plan (same source the Usage tab shows), else /v1/plan.
-                // Group-scoped when this phone joined one, with device identity
-                // so member/admin views work; 403 totals-only still carries plan.
-                val group = store.groupId.first().ifBlank { null }
                 val deviceId = nodeId()
-                val usageStages = runCatching { DllmApi.getUsage(base, group, deviceId).planStages }
+                val usageStages = runCatching { DllmApi.getUsage(base, deviceId).planStages }
                     .recoverCatching { e ->
                         (e as? com.dllm.mesh.net.UsageForbiddenException)?.summary?.planStages
                             ?: throw e
@@ -522,28 +520,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 }
 
-/** Compresses expanded layer lists into "0–27" style ranges. */
-private fun layerRangeText(layers: List<Int>): String {
-    if (layers.isEmpty()) return "none"
-    val sorted = layers.sorted()
-    val ranges = ArrayList<String>()
-    var s = sorted[0]
-    var p = sorted[0]
-    for (i in 1..sorted.size) {
-        val c = if (i < sorted.size) sorted[i] else Int.MIN_VALUE
-        if (c == p + 1) {
-            p = c
-            continue
-        }
-        ranges.add(if (s == p) "$s" else "$s–$p")
-        if (i < sorted.size) {
-            s = c
-            p = c
-        }
-    }
-    return ranges.joinToString(", ")
-}
-
+/**
+ * Compresses expanded layer lists into "0–27" style ranges.
+ *
+ * Lives in `com.dllm.mesh.data` ([layerRangeText]) because the Usage strip and
+ * the Devices roster render the same plan and must produce identical text.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
@@ -595,10 +577,10 @@ fun ChatScreen(
         }
         map.mapValues { it.value.distinct().sorted() }
     }
+    // "All layers on one device" is checked against the shared model topology so
+    // this fast-path badge cannot disagree with what the planner assigned.
     val singleDeviceFastPath = layersByDevice.size == 1 &&
-        layersByDevice.values.firstOrNull()?.size == 28 &&
-        layersByDevice.values.firstOrNull()?.firstOrNull() == 0 &&
-        layersByDevice.values.firstOrNull()?.lastOrNull() == 27
+        coversWholeModel(layersByDevice.values.first())
 
     val currentTitle = sessions.firstOrNull { it.id == sessionId }?.title ?: "Chat"
 
@@ -616,7 +598,7 @@ fun ChatScreen(
                     ) {
                         Text(
                             if (sessionsKnown) "Chats (${sessions.size})" else "Chats",
-                            color = Color(0xFFE8EDF2),
+                            color = MeshColors.Text,
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedButton(onClick = { viewModel.refreshLocal() }) {
@@ -629,12 +611,12 @@ fun ChatScreen(
                         }
                     }
                     Spacer(Modifier.height(4.dp))
-                    Text("Stored on this phone only.", color = Color(0xFF93A1B0))
+                    Text("Stored on this phone only.", color = MeshColors.Muted)
                     if (needsUpgrade) {
                         Spacer(Modifier.height(4.dp))
                         Text(
                             "Server sync unavailable — coordinator needs upgrade.",
-                            color = Color(0xFFF5B544),
+                            color = MeshColors.Amber,
                         )
                     }
                     Spacer(Modifier.height(8.dp))
@@ -644,11 +626,11 @@ fun ChatScreen(
                             NavigationDrawerItem(
                                 label = {
                                     Column {
-                                        Text(s.title, color = Color(0xFFE8EDF2))
+                                        Text(s.title, color = MeshColors.Text)
                                         Text(
                                             "${s.model} · ${s.tokensOut} out" +
                                                 (s.lastTokenAt?.let { " · $it" } ?: ""),
-                                            color = Color(0xFF93A1B0),
+                                            color = MeshColors.Muted,
                                         )
                                     }
                                 },
@@ -657,7 +639,7 @@ fun ChatScreen(
                                         Icon(
                                             Icons.Filled.MoreVert,
                                             contentDescription = "Chat options",
-                                            tint = Color(0xFF93A1B0),
+                                            tint = MeshColors.Muted,
                                         )
                                     }
                                 },
@@ -698,7 +680,7 @@ fun ChatScreen(
                         }
                     }
                     if (sessionsKnown && sessions.isEmpty()) {
-                        Text("No chats yet — start a New chat.", color = Color(0xFF93A1B0))
+                        Text("No chats yet — start a New chat.", color = MeshColors.Muted)
                     }
                 }
             }
@@ -706,7 +688,7 @@ fun ChatScreen(
         modifier = modifier,
     ) {
         Scaffold(
-            containerColor = Color(0xFF101418),
+            containerColor = MeshColors.Ink,
             topBar = {
                 TopAppBar(
                     title = { Text(currentTitle) },
@@ -715,7 +697,7 @@ fun ChatScreen(
                             Icon(
                                 Icons.Filled.Menu,
                                 contentDescription = "Chat history",
-                                tint = Color(0xFFE8EDF2),
+                                tint = MeshColors.Text,
                             )
                         }
                     },
@@ -725,30 +707,30 @@ fun ChatScreen(
             Column(Modifier.fillMaxSize().padding(padding).padding(16.dp)) {
                 // Layer toggle: truthful per-device ranges, never invented.
                 TextButton(onClick = { splitExpanded = !splitExpanded }) {
-                    Text("Model split ${if (splitExpanded) "▴" else "▾"}", color = Color(0xFF2DD4BF))
+                    Text("Model split ${if (splitExpanded) "▴" else "▾"}", color = MeshColors.Teal)
                 }
                 if (splitExpanded) {
-                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF171D24))) {
+                    Card(colors = CardDefaults.cardColors(containerColor = MeshColors.Panel)) {
                         Column(Modifier.fillMaxWidth().padding(12.dp)) {
                             if (!planKnown) {
                                 Text(
                                     "Model split unavailable — coordinator needs upgrade.",
-                                    color = Color(0xFFF5B544),
+                                    color = MeshColors.Amber,
                                 )
                             } else if (layersByDevice.isEmpty()) {
-                                Text("No layer assignment reported.", color = Color(0xFF93A1B0))
+                                Text("No layer assignment reported.", color = MeshColors.Muted)
                             } else {
                                 for ((dev, layers) in layersByDevice) {
                                     Text(
                                         "$dev: layers ${layerRangeText(layers)} (${layers.size} layers)",
-                                        color = Color(0xFFE8EDF2),
+                                        color = MeshColors.Text,
                                     )
                                 }
                                 if (singleDeviceFastPath) {
                                     Spacer(Modifier.height(4.dp))
                                     Text(
                                         "All 28 layers on this coordinator — single-device fast path.",
-                                        color = Color(0xFF93A1B0),
+                                        color = MeshColors.Muted,
                                     )
                                 }
                             }
@@ -757,7 +739,7 @@ fun ChatScreen(
                     Spacer(Modifier.height(8.dp))
                 }
 
-                Text(status, color = Color(0xFF93A1B0))
+                Text(status, color = MeshColors.Muted)
                 Spacer(Modifier.height(8.dp))
 
                 LazyColumn(
@@ -768,27 +750,27 @@ fun ChatScreen(
                     items(messages) { msg ->
                         Card(
                             colors = CardDefaults.cardColors(
-                                containerColor = if (msg.role == "user") Color(0xFF171D24) else Color(0xFF1B2B28),
+                                containerColor = if (msg.role == "user") MeshColors.Panel else MeshColors.PanelActive,
                             ),
                             modifier = Modifier.fillMaxWidth(),
                         ) {
                             Text(
                                 text = "${msg.role}: ${msg.text}",
                                 modifier = Modifier.padding(12.dp),
-                                color = Color(0xFFE8EDF2),
+                                color = MeshColors.Text,
                             )
                         }
                     }
                     if (streaming.isNotEmpty()) {
                         item {
                             Card(
-                                colors = CardDefaults.cardColors(containerColor = Color(0xFF1B2B28)),
+                                colors = CardDefaults.cardColors(containerColor = MeshColors.PanelActive),
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
                                 Text(
                                     text = "assistant: $streaming",
                                     modifier = Modifier.padding(12.dp),
-                                    color = Color(0xFF2DD4BF),
+                                    color = MeshColors.Teal,
                                 )
                             }
                         }
@@ -835,7 +817,7 @@ fun ChatScreen(
                     )
                     if (renameError.isNotEmpty()) {
                         Spacer(Modifier.height(4.dp))
-                        Text(renameError, color = Color(0xFFF5B544))
+                        Text(renameError, color = MeshColors.Amber)
                     }
                 }
             },

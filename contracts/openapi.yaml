@@ -32,7 +32,7 @@ paths:
   /api/stats:
     get:
       operationId: stats
-      summary: uptime_s / engine / sessions / events / node_id
+      summary: uptime_s / engine / sessions / events / node_id / mesh summary
       responses:
         '200':
           description: ok
@@ -40,13 +40,20 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [uptime_s, engine, sessions, events, node_id]
+                required: [uptime_s, engine, sessions, events, node_id, mesh]
                 properties:
                   uptime_s: { type: integer }
                   engine: { type: string, enum: [llama, mock] }
                   sessions: { type: integer }
                   events: { type: integer }
                   node_id: { type: string }
+                  mesh:
+                    type: object
+                    description: Counts only — link-level detail lives on GET /v1/mesh.
+                    required: [peers_connected, allowed_peers]
+                    properties:
+                      peers_connected: { type: integer, description: Links with a live QUIC connection. }
+                      allowed_peers: { type: integer, description: Registry rows currently eligible for the mTLS allow-list (paired + has cert_fp). }
   /api/pairing-uri:
     get:
       operationId: pairingUri
@@ -435,7 +442,7 @@ paths:
   /v1/plan:
     get:
       operationId: activePlan
-      summary: Honest single-device v1 plan (self runs layers 0-27); ?group= scopes to a network's paired+active worker candidates via plan_layers
+      summary: Computed plan from dllm_core::plan_layers for every arity (plan_id is the planner's real membership hash; single-device v1 = self runs layers 0-27); ?group= scopes to a network's paired+active worker candidates
       parameters:
         - name: group
           in: query
@@ -460,6 +467,17 @@ paths:
                 properties:
                   ok: { type: boolean }
                   error: { type: string }
+  /v1/mesh:
+    get:
+      operationId: meshStatus
+      summary: Live mTLS QUIC mesh — the bound socket plus one entry per accepted peer link. Allow-list is derived from the device registry (paired + has a cert_fp); a device that only sends an HTTP heartbeat is NOT mesh-eligible.
+      responses:
+        '200':
+          description: ok (quic_port 0 + endpoint "unbound" when the mesh failed to bind — HTTP keeps serving; no stage traffic flows yet)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Mesh'
   /v1/networks:
     get:
       operationId: listNetworks
@@ -910,21 +928,28 @@ components:
             layer_end: { type: integer, example: 27 }
     Plan:
       type: object
-      required: [plan_id, stages]
+      description: Layer split computed by dllm_core::plan_layers — plan_id is the planner's real membership hash, never a constant. No pipeline runs yet, so every latency field is an explicit null.
+      required: [plan_id, stages, bottleneck]
       properties:
         plan_id: { type: integer }
         stages:
           type: array
           items:
             type: object
-            required: [stage, device_id, layer_start, layer_end]
+            required: [stage, device_id, layer_start, layer_end, latency_ms]
             properties:
               stage: { type: integer }
               device_id: { type: string }
               layer_start: { type: integer }
               layer_end: { type: integer }
-              latency_ms: { type: number, description: Planned per-stage latency (absent in single-device v1). }
-        bottleneck: { type: integer }
+              latency_ms:
+                type: number
+                nullable: true
+                description: Per-stage latency in ms. ALWAYS explicit null today — nothing measures stage time over the mesh yet, so the key is present but null (never omitted, never invented).
+        bottleneck:
+          type: integer
+          nullable: true
+          description: Index of the slowest stage. ALWAYS explicit null today for the same reason as latency_ms.
         note: { type: string, example: single-device fast path }
     Usage:
       type: object
@@ -977,3 +1002,42 @@ components:
         bandwidth:
           nullable: true
           description: NOT measured anywhere yet — always explicit null, never fake numbers.
+    Mesh:
+      type: object
+      description: Observability over the live QUIC mesh. Reports what is actually bound and connected — it does NOT mean a pipeline is running (stage activation execution across devices is still unwired).
+      required: [quic_port, endpoint, peers, allowed_peer_count]
+      properties:
+        quic_port:
+          type: integer
+          description: Actually bound UDP port; 0 = the mesh is not listening (bind failed, or the caller never started it).
+          example: 8443
+        endpoint:
+          type: string
+          description: "Bound socket as host:port, or \"unbound\" when quic_port is 0."
+          example: 0.0.0.0:8443
+        peers:
+          type: array
+          description: One entry per accepted connection, keyed by certificate fingerprint. A closed link is kept with connected:false for forensics; an empty array is honest, not a stub.
+          items:
+            $ref: '#/components/schemas/MeshPeer'
+        allowed_peer_count:
+          type: integer
+          description: Registry rows eligible for the mTLS allow-list (status paired AND a non-null non-empty cert_fp). Heartbeat-only devices are counted out until they pair with a certificate.
+    MeshPeer:
+      type: object
+      description: One live mesh link. device_name and rtt_us are null when unknown — never synthesized.
+      required: [device_id, device_name, fingerprint, rtt_us, connected, connected_since_ms, last_seen_ms]
+      properties:
+        device_id: { type: string, description: Resolved from the peer fingerprint via the registry allow-list. }
+        device_name:
+          type: string
+          nullable: true
+          description: Friendly OS hostname; null = the peer never reported one (client falls back to device_id).
+        fingerprint: { type: string, description: Peer certificate fingerprint (sha256 of cert DER) — the TOFU identity. }
+        rtt_us:
+          type: integer
+          nullable: true
+          description: Rolling median RTT over a bounded window; null until a real round-trip sample exists.
+        connected: { type: boolean, description: False once the QUIC connection reports a close reason. }
+        connected_since_ms: { type: integer, format: int64, description: Unix ms when this link was accepted. }
+        last_seen_ms: { type: integer, format: int64, description: Unix ms of the last monitor-tick refresh (closed links stop advancing). }

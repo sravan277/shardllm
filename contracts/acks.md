@@ -16,6 +16,30 @@ the per-edge stream (see `activation-frame.md`).
 
 `pos` = `token_position` (`u32`, 0-based, dense per session).
 
+## ACK wire framing
+
+ACKs are **not** activation frames and must never share their magic. Layout,
+little-endian throughout:
+
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| 0 | 4 | `magic` | ASCII `ACK1` (`41 43 4B 31`). Reject anything else |
+| 4 | 4 | `body_length` | Byte length of the JSON body that follows |
+| 8 | N | `body` | UTF-8 JSON: `{"ack":"COMPUTED","pos":3,"token":42}` |
+
+- Total ACK = `8 + body_length`; cap `body_length <= 256` bytes (ACKs are tiny).
+- `ack` is exactly one of the five vocabulary strings above; anything else is
+  an unknown ACK and the edge is torn down.
+- `pos` and `token` are `u32`. `token` is the tail-sampled token id; for
+  `RECEIVED`/`COMPUTED`/`KV_TENTATIVE` it is the id being propagated.
+- A buffer whose first 4 bytes are `ACK1` handed to the activation-frame
+  decoder is rejected as `BadMagic`, and vice versa. The two namespaces are
+  disjoint by construction.
+- Rationale for JSON in the body rather than a fixed binary tuple: ACKs are
+  latency-critical but tiny, and a plain-text body keeps them inspectable with
+  `curl`/packet capture during bring-up. The framing (not the body) is what
+  guarantees stream desynchronisation is impossible.
+
 ## Optimistic primary-backup flow (no per-token 2PC)
 
 ```text

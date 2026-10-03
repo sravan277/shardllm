@@ -23,13 +23,15 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.dllm.mesh.data.IdentityStore
+import com.dllm.mesh.data.ModelTopology
+import com.dllm.mesh.data.coversWholeModel
+import com.dllm.mesh.data.layerRangeText
 import com.dllm.mesh.net.DllmApi
 import com.dllm.mesh.net.PlanStage
 import com.dllm.mesh.net.UsageDevice
@@ -52,9 +54,6 @@ class UsageViewModel(application: Application) : AndroidViewModel(application) {
 
     val coordinatorUrl: StateFlow<String> = store.coordinatorUrl
         .stateIn(viewModelScope, SharingStarted.Eagerly, IdentityStore.DEFAULT_COORDINATOR_URL)
-
-    val groupId: StateFlow<String> = store.groupId
-        .stateIn(viewModelScope, SharingStarted.Eagerly, "")
 
     private val _summary = MutableStateFlow<UsageSummary?>(null)
     val summary: StateFlow<UsageSummary?> = _summary.asStateFlow()
@@ -88,9 +87,12 @@ class UsageViewModel(application: Application) : AndroidViewModel(application) {
             _loading.value = true
             runCatching {
                 val base = store.coordinatorUrl.first()
-                val group = store.groupId.first().ifBlank { null }
-                val deviceId = store.ensureNodeId()
-                DllmApi.getUsage(base, group, deviceId)
+                // Whole-mesh totals: the roster of per-device rows belongs to the
+                // Devices tab now, and the mesh is a single network, so there is
+                // no group to narrow this by. ensureNodeId() still runs so the
+                // heartbeat later in the send path has a row to update.
+                store.ensureNodeId()
+                DllmApi.getUsage(base, null)
             }.onSuccess { usage ->
                 _summary.value = usage
                 _needsUpgrade.value = false
@@ -109,13 +111,14 @@ class UsageViewModel(application: Application) : AndroidViewModel(application) {
             }.onFailure { e ->
                 if (e is CancellationException) throw e
                 if (e is com.dllm.mesh.net.UsageForbiddenException) {
-                    // Group-scoped denial still carries honest totals: show
-                    // them with an explanation instead of an empty error.
+                    // A denial still carries honest totals: show them with an
+                    // explanation instead of an empty error screen.
                     _summary.value = e.summary
                     _planFallback.value = emptyList()
                     _needsUpgrade.value = false
-                    _status.value = "Totals only — this phone is not a group member " +
-                        "(or not admin): per-device rows need a group join + admin."
+                    _status.value = "Totals only — this phone is not permitted to read " +
+                        "per-device rows (HTTP 403). The coordinator lists the full breakdown " +
+                        "on its own Devices page."
                     _loading.value = false
                     return@launch
                 }
@@ -137,27 +140,6 @@ class UsageViewModel(application: Application) : AndroidViewModel(application) {
 private fun shortDevice(id: String): String =
     if (id.length > 20) "${id.take(9)}…${id.takeLast(4)}" else id
 
-private fun layerRangeText(layers: List<Int>): String {
-    if (layers.isEmpty()) return "none"
-    val sorted = layers.sorted()
-    val ranges = ArrayList<String>()
-    var s = sorted[0]
-    var p = sorted[0]
-    for (i in 1..sorted.size) {
-        val c = if (i < sorted.size) sorted[i] else Int.MIN_VALUE
-        if (c == p + 1) {
-            p = c
-            continue
-        }
-        ranges.add(if (s == p) "$s" else "$s–$p")
-        if (i < sorted.size) {
-            s = c
-            p = c
-        }
-    }
-    return ranges.joinToString(", ")
-}
-
 @Composable
 fun UsageScreen(
     viewModel: UsageViewModel = viewModel(),
@@ -165,7 +147,6 @@ fun UsageScreen(
 ) {
     val context = LocalContext.current
     val summary by viewModel.summary.collectAsState()
-    val groupId by viewModel.groupId.collectAsState()
     val planFallback by viewModel.planFallback.collectAsState()
     val needsUpgrade by viewModel.needsUpgrade.collectAsState()
     val loading by viewModel.loading.collectAsState()
@@ -185,7 +166,7 @@ fun UsageScreen(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("Usage", color = Color(0xFFE8EDF2))
+            Text("Usage", color = MeshColors.Text)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = viewModel::refresh, enabled = !loading) {
                     Text(if (loading) "Loading…" else "Refresh")
@@ -195,21 +176,21 @@ fun UsageScreen(
         Spacer(Modifier.height(4.dp))
         when {
             loading && summary == null && !needsUpgrade -> {
-                Text("Loading usage…", color = Color(0xFF93A1B0))
+                Text("Loading usage…", color = MeshColors.Muted)
             }
             needsUpgrade -> {
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF171D24))) {
+                Card(colors = CardDefaults.cardColors(containerColor = MeshColors.Panel)) {
                     Column(Modifier.fillMaxWidth().padding(12.dp)) {
-                        Text("Compute share unavailable", color = Color(0xFFE8EDF2))
+                        Text("Compute share unavailable", color = MeshColors.Text)
                         Spacer(Modifier.height(4.dp))
                         Text(
                             "unavailable — coordinator needs upgrade",
-                            color = Color(0xFFF5B544),
+                            color = MeshColors.Amber,
                         )
                         Spacer(Modifier.height(4.dp))
                         Text(
                             "Upgrade the coordinator to serve GET /v1/usage. Nothing here is guessed.",
-                            color = Color(0xFF93A1B0),
+                            color = MeshColors.Muted,
                         )
                     }
                 }
@@ -223,30 +204,30 @@ fun UsageScreen(
                     for (l in st.layerStart..st.layerEnd) arr.add(l)
                 }
                 val distinctLayers = layersByDevice.values.flatten().distinct().sorted()
+                // Compared against the shared model topology: the "single-device
+                // fast path" badge is a claim about the model, so it must be
+                // checked against the same constants the planner was given.
                 val singleDevice = layersByDevice.size == 1 &&
-                    distinctLayers.size == 28 &&
-                    distinctLayers.firstOrNull() == 0 &&
-                    distinctLayers.lastOrNull() == 27
+                    coversWholeModel(distinctLayers)
 
                 Text(
-                    "${u.tokensOutTotal} tokens out · ${u.sessionsTotal} sessions" +
-                        (groupId.ifBlank { null }?.let { " · group $it" } ?: ""),
-                    color = Color(0xFF93A1B0),
+                    "${u.tokensOutTotal} tokens out · ${u.sessionsTotal} sessions",
+                    color = MeshColors.Muted,
                 )
                 Spacer(Modifier.height(8.dp))
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(u.perDevice, key = { it.deviceId }) { d: UsageDevice ->
-                        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF171D24))) {
+                        Card(colors = CardDefaults.cardColors(containerColor = MeshColors.Panel)) {
                             Column(Modifier.fillMaxWidth().padding(12.dp)) {
                                 Text(
                                     d.deviceName?.takeIf { it.isNotBlank() } ?: shortDevice(d.deviceId),
-                                    color = Color(0xFFE8EDF2),
+                                    color = MeshColors.Text,
                                 )
-                                Text(d.deviceId, color = Color(0xFF93A1B0))
+                                Text(d.deviceId, color = MeshColors.Muted)
                                 Spacer(Modifier.height(4.dp))
                                 Text(
                                     "tokens_out: ${d.tokensOut} · sessions: ${d.sessions}",
-                                    color = Color(0xFF2DD4BF),
+                                    color = MeshColors.Teal,
                                 )
                                 Spacer(Modifier.height(4.dp))
                                 // Honest load dot: green only when the server has
@@ -260,10 +241,10 @@ fun UsageScreen(
                                 }
                                 Text(
                                     loadLine,
-                                    color = if (hasLoad) Color(0xFF2DD4BF) else Color(0xFF93A1B0),
+                                    color = if (hasLoad) MeshColors.Teal else MeshColors.Muted,
                                 )
                                 if (!d.role.isNullOrBlank()) {
-                                    Text("role: ${d.role}", color = Color(0xFF93A1B0))
+                                    Text("role: ${d.role}", color = MeshColors.Muted)
                                 }
                                 // Compute-worker pill from the heartbeat
                                 // `worker_active` flag: green only when the
@@ -272,17 +253,17 @@ fun UsageScreen(
                                     true -> Triple(
                                         "●",
                                         "worker active — takes pipeline layers",
-                                        Color(0xFF2DD4BF),
+                                        MeshColors.Teal,
                                     )
                                     false -> Triple(
                                         "○",
                                         "worker idle — chat only",
-                                        Color(0xFF93A1B0),
+                                        MeshColors.Muted,
                                     )
                                     null -> Triple(
                                         "○",
                                         "worker state: not reporting",
-                                        Color(0xFF93A1B0),
+                                        MeshColors.Muted,
                                     )
                                 }
                                 Text(
@@ -304,7 +285,7 @@ fun UsageScreen(
                                     } else {
                                         "layers: —"
                                     },
-                                    color = Color(0xFF93A1B0),
+                                    color = MeshColors.Muted,
                                 )
                             }
                         }
@@ -313,21 +294,21 @@ fun UsageScreen(
                 Spacer(Modifier.height(8.dp))
                 if (singleDevice) {
                     Text(
-                        "All 28 layers on this coordinator — single-device fast path.",
-                        color = Color(0xFF93A1B0),
+                        "All ${ModelTopology.TOTAL_LAYERS} layers on this coordinator — single-device fast path.",
+                        color = MeshColors.Muted,
                     )
                 }
-                Text("Link bandwidth not yet measured.", color = Color(0xFF93A1B0))
+                Text("Link bandwidth not yet measured.", color = MeshColors.Muted)
                 if (status.isNotBlank()) {
                     Spacer(Modifier.height(4.dp))
-                    Text(status, color = Color(0xFFF5B544))
+                    Text(status, color = MeshColors.Amber)
                 }
             }
             else -> {
                 Text(
                     if (status.isNotBlank()) status
                     else "No usage data — check the coordinator, then Refresh.",
-                    color = Color(0xFFF5B544),
+                    color = MeshColors.Amber,
                 )
                 Spacer(Modifier.height(8.dp))
                 Button(onClick = viewModel::refresh, enabled = !loading) { Text("Retry") }

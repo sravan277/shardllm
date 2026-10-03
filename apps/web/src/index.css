@@ -1,3 +1,10 @@
+/* DLLM Mesh — LAN-signal theme.
+ *
+ * Type: system stack only. docs/SETUP.md forbids external fonts and CDNs
+ * (the mesh must work with no internet), so "Space Grotesk" is deliberately
+ * not named anywhere: it was never loaded, so the browser silently fell
+ * back anyway and the name was a lie.
+ */
 :root {
   --ink: #101418;
   --panel: #171d24;
@@ -7,12 +14,13 @@
   --muted: #93a1b0;
   --teal: #2dd4bf;
   --amber: #f5b544;
-  --sans: "Space Grotesk", system-ui, "Segoe UI", Roboto, sans-serif;
-  --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  --sans: system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "Cascadia Code", Consolas, "SF Mono", monospace;
   color-scheme: dark;
   background: var(--ink);
   color: var(--text);
   font-family: var(--sans);
+  --radius: 14px;
 }
 * { box-sizing: border-box; }
 body { margin: 0; }
@@ -23,44 +31,56 @@ body { margin: 0; }
 .brand { display: flex; gap: 12px; align-items: center; }
 .brand h1 { margin: 0; font-size: 26px; letter-spacing: -0.02em; }
 .brand p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+.brand .identity { display: flex; gap: 10px; flex-wrap: wrap; }
 .mark { width: 34px; height: 34px; border-radius: 10px;
   background: conic-gradient(from 210deg, var(--teal), #0e7490, var(--teal));
   box-shadow: 0 0 24px rgba(45, 212, 191, 0.45); }
-.conn { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.conn { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .conn input { background: var(--panel); border: 1px solid var(--line); color: var(--text);
-  border-radius: 8px; padding: 8px 10px; width: 240px; font-family: var(--mono); font-size: 13px; }
-.pill { font-size: 12px; padding: 6px 10px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  border-radius: 8px; padding: 8px 10px; width: 230px; font-family: var(--mono); font-size: 13px; }
+.conn input[aria-invalid="true"] { border-color: var(--amber); }
+
+/* Status pills. `pill` is a span (read only), `pill-button` is the clickable
+   one, so the connection pill can be a real button with no visual drift. */
+.pill { font-size: 12px; padding: 5px 10px; border-radius: 999px; border: 1px solid var(--line);
+  color: var(--muted); background: transparent; display: inline-block; }
 .pill.live { color: #06281f; background: var(--teal); border-color: var(--teal); font-weight: 700; }
-.pill.down { color: var(--amber); border-color: var(--amber); }
+.pill.warn { color: var(--amber); border-color: var(--amber); }
+.pill-row { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 8px; }
+.pill-button { font-size: 12px; padding: 6px 12px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--line); color: var(--muted); background: var(--panel); font-family: var(--sans); }
+.pill-button:hover { border-color: var(--teal); color: var(--text); }
+.pill-button.live { color: #06281f; background: var(--teal); border-color: var(--teal); font-weight: 700; }
+.pill-button.warn { color: var(--amber); border-color: var(--amber); }
+.pill-button.down { color: var(--amber); border-color: var(--amber); }
 
 .nav { display: flex; gap: 8px; flex-wrap: wrap; }
 .nav button { background: transparent; border: 1px solid var(--line); color: var(--muted);
   padding: 8px 16px; border-radius: 8px; cursor: pointer; font: inherit; font-size: 14px; }
 .nav button.on { background: var(--panel2); color: var(--text); border-color: var(--teal); }
-.drawer-toggle { background: transparent; border: 1px solid var(--line); color: var(--muted);
-  padding: 8px 14px; border-radius: 8px; cursor: pointer; font: inherit; font-size: 14px; }
-.drawer-toggle:hover { color: var(--text); border-color: var(--teal); }
 .ghost { background: transparent; border: 1px solid var(--line); color: var(--muted);
   padding: 8px 14px; border-radius: 8px; cursor: pointer; font: inherit; font-size: 13px; }
 .ghost.on { color: var(--text); border-color: var(--teal); }
 
 .notice { background: rgba(245, 181, 68, 0.12); border: 1px solid var(--amber); color: var(--amber);
-  padding: 10px 14px; border-radius: 10px; margin: 14px 0; font-size: 14px; }
+  padding: 10px 14px; border-radius: 10px; margin: 14px 0 0; font-size: 14px; }
+.notice.inline { margin: 8px 0 0; font-size: 13px; }
 
-/* ChatGPT-like chat tab: centered thread column, composer docked, drawer right. */
+/* Chat: centered thread column, composer docked, drawer right. */
 .chatgpt { display: flex; gap: 14px; align-items: flex-start; margin-top: 14px; }
 .thread-col { flex: 1 1 auto; min-width: 0; max-width: 780px; margin: 0 auto;
-  background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
   display: flex; flex-direction: column; overflow: hidden; }
 .thread-head { display: flex; justify-content: space-between; align-items: center; gap: 10px;
   padding: 10px 14px; border-bottom: 1px solid var(--line); }
 .thread-head strong { font-size: 15px; display: block; overflow-wrap: anywhere; }
 .thread-id { min-width: 0; }
+.head-actions { flex-wrap: wrap; }
 .layer-panel { padding: 12px 14px; border-bottom: 1px solid var(--line); }
 .layer-panel h2 { margin: 0 0 8px; font-size: 14px; color: var(--muted); font-weight: 600; }
 .thread-meta { padding: 8px 14px 12px; margin: 0; }
 .chat-drawer { width: 300px; flex: none; background: var(--panel); border: 1px solid var(--line);
-  border-radius: 14px; padding: 12px; align-self: flex-start; max-height: 72vh; overflow-y: auto;
+  border-radius: var(--radius); padding: 12px; align-self: flex-start; max-height: 72vh; overflow-y: auto;
   display: none; flex-direction: column; gap: 8px; }
 .chat-drawer.open { display: flex; }
 .drawer-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 14px; }
@@ -100,18 +120,27 @@ body { margin: 0; }
 .usage-pop p { margin: 4px 0; }
 .drawer-backdrop { display: none; }
 @media (max-width: 900px) {
+  /* The scrim is scoped to the chat column, not the whole viewport: a
+     full-page modal would swallow the nav and the connection box, leaving a
+     phone user unable to switch tabs or reconnect. */
   .chatgpt { position: relative; }
-  .chat-drawer.open { position: fixed; right: 12px; top: 12px; bottom: 12px; z-index: 40;
-    max-height: none; box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55); }
-  .drawer-backdrop { display: block; position: fixed; inset: 0; z-index: 30;
+  .chat-drawer.open { position: absolute; right: 0; top: 0; bottom: 0; z-index: 40;
+    max-height: none; box-shadow: -16px 0 48px rgba(0, 0, 0, 0.55); }
+  .drawer-backdrop { display: block; position: absolute; inset: 0; z-index: 30;
     background: rgba(8, 12, 16, 0.6); }
 }
 .thread { padding: 18px; min-height: 380px; max-height: 56vh; overflow-y: auto;
   display: flex; flex-direction: column; gap: 10px; }
 .empty h2 { margin: 40px 0 6px; font-size: 22px; }
-.empty p { color: var(--muted); max-width: 52ch; }
+.empty h3 { margin: 12px 0 4px; font-size: 16px; color: var(--text); }
+.empty p { color: var(--muted); max-width: 52ch; margin: 0 0 8px; }
+.empty-actions { gap: 8px; }
 .mono { font-family: var(--mono); font-size: 12px; color: var(--muted); }
-.bubble { max-width: 78%; padding: 10px 14px; border-radius: 12px; font-size: 15px; line-height: 1.45; white-space: pre-wrap; }
+/* Metadata reads as separate chips. docs/MASTER_PLAN.md 11.5 forbids the
+   "a · b · c" meta string, so nothing joins these with a separator. */
+.meta-chips { display: flex; gap: 12px; flex-wrap: wrap; }
+.bubble { max-width: 78%; padding: 10px 14px; border-radius: 12px; font-size: 15px; line-height: 1.45;
+  white-space: pre-wrap; overflow-wrap: anywhere; }
 .bubble.you { align-self: flex-end; background: #0e3b35; border: 1px solid rgba(45, 212, 191, 0.4); }
 .bubble.mesh { align-self: flex-start; background: var(--panel2); border: 1px solid var(--line); }
 .typing { color: var(--teal); font-size: 13px; animation: pulse 1.2s infinite; }
@@ -121,60 +150,103 @@ body { margin: 0; }
   border-radius: 10px; padding: 12px; font: inherit; font-size: 15px; }
 button { font: inherit; }
 .composer button, .card button, .row button { background: var(--teal); color: #06281f; font-weight: 700;
-  border: none; border-radius: 10px; padding: 12px 18px; cursor: pointer; }
-.composer button:disabled { opacity: 0.4; cursor: default; }
+  border: none; border-radius: 10px; padding: 10px 16px; cursor: pointer; }
+.composer button:disabled, .card button:disabled, .row button:disabled { opacity: 0.45; cursor: default; }
+/* Ghost buttons must win over the `.row button` fill above, wherever they sit. */
+.card button.ghost, .conn button.ghost, .row button.ghost, .thread-head button.ghost,
+.pairing-detail button.secondary {
+  background: transparent; color: var(--muted); font-weight: 400; border: 1px solid var(--line); }
+.card button.ghost:hover, .row button.ghost:hover, .thread-head button.ghost:hover,
+.pairing-detail button.secondary:hover { color: var(--text); border-color: var(--teal); }
+.row button.ghost.on { color: var(--text); border-color: var(--teal); }
+.row button.danger { background: transparent; border: 1px solid var(--amber); color: var(--amber); }
+.pairing-detail button.secondary { align-self: flex-start; padding: 8px 14px; font-size: 13px; }
 
-.card h2 { margin: 0 0 12px; font-size: 15px; color: var(--muted); font-weight: 600; }
-.hint { color: var(--muted); font-size: 13px; }
-
+/* Cards, panels, grids. */
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; }
+.card h2 { margin: 0 0 10px; font-size: 16px; color: var(--text); }
+.card h3 { margin: 0 0 6px; font-size: 15px; color: var(--text); }
+.card h2 + .hint, .card h3 + .hint { margin-top: 0; }
+.hint { color: var(--muted); font-size: 13px; line-height: 1.5; }
+.hint.warn { color: var(--amber); }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
-.card h2 { color: var(--text); font-size: 17px; }
+.cards > .empty { grid-column: 1 / -1; }
 .shards { display: flex; gap: 6px; margin: 10px 0 14px; flex-wrap: wrap; }
-.shards span { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; color: var(--teal); }
+.shards span { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line);
+  border-radius: 6px; padding: 3px 8px; color: var(--teal); }
 .row { display: flex; gap: 8px; }
-.row input, .row select, #sessbox { flex: 1; background: var(--ink); border: 1px solid var(--line); color: var(--text);
+.row input, .row select { flex: 1; background: var(--ink); border: 1px solid var(--line); color: var(--text);
   border-radius: 10px; padding: 10px; font-family: var(--mono); font-size: 13px; }
 
-footer { margin-top: 22px; color: var(--muted); font-size: 12px; font-family: var(--mono); }
-@media (prefers-reduced-motion: reduce) { .typing { animation: none; } }
+footer { margin-top: 22px; color: var(--muted); font-size: 12px; font-family: var(--mono); line-height: 1.5; }
 
-.fleet { display: flex; flex-direction: column; gap: 14px; }
-.fleet-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
-.fleet-h { color: var(--muted); font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; margin: 4px 0 10px; }
-.qr { border-radius: 10px; border: 1px solid var(--line); background: #fff; margin-bottom: 10px; }
+.fleet { display: flex; flex-direction: column; gap: 14px; margin-top: 14px; }
+.fleet-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;
+  flex-wrap: wrap; margin-bottom: 10px; }
+.fleet-head h2 { margin-bottom: 4px; }
+.fleet-head .hint { margin: 0; }
+.usage-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
+.device-card h3 { overflow-wrap: anywhere; }
+.device-card .hint { margin: 6px 0 10px; }
+
+/* Distribution: layer strip, stage table, load + link readouts. */
+.layer-strip-wrap { display: flex; flex-direction: column; gap: 8px; }
+.layer-strip { display: flex; gap: 3px; border-radius: 10px; overflow: hidden; min-height: 74px; }
+.layer-run { flex-basis: 0; min-width: 0; display: flex; flex-direction: column; justify-content: center;
+  gap: 2px; padding: 10px 12px; color: #06211d; overflow: hidden; }
+.layer-run .mono { color: #06211d; opacity: 0.85; }
+.layer-run-name { font-size: 14px; font-weight: 700; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; }
+.layer-run.unassigned { background: repeating-linear-gradient(135deg, #2a3340, #2a3340 6px, #1e2530 6px, #1e2530 12px);
+  color: var(--muted); }
+.layer-run.unassigned .mono { color: var(--muted); }
+
+.stage-table-wrap { display: flex; flex-direction: column; gap: 8px; }
+.stage-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.stage-table th, .stage-table td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+.stage-table thead th { color: var(--muted); font-size: 12px; font-weight: 600; }
+.stage-table tbody th { font-weight: 600; display: flex; gap: 8px; align-items: center; }
+.stage-table tr.bottleneck { background: rgba(245, 181, 68, 0.08); }
+.stage-table tr.bottleneck td:first-child, .stage-table tr.bottleneck th { box-shadow: inset 2px 0 0 var(--amber); }
+
+.load-bars { display: flex; flex-direction: column; gap: 2px; margin: 8px 0 10px; }
+.load-bars.compact { margin: 6px 0 2px; }
+.meter { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.bar { height: 8px; background: var(--panel2); border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--teal); }
+.bar > i.load { background: linear-gradient(90deg, var(--teal), #0e7490); }
+
+.kv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.kv-item { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--panel2);
+  display: flex; flex-direction: column; gap: 4px; }
+.kv-key { font-size: 12px; color: var(--muted); }
+.kv-val { font-size: 16px; font-family: var(--mono); }
+
+/* Pairing card. */
+.pairing { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+.pairing-code { flex: none; }
+.pairing-detail { flex: 1 1 260px; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.pairing-detail .sub { margin-top: 6px; }
+.qr { border-radius: 10px; border: 1px solid var(--line); background: #fff; max-width: 100%; height: auto; }
 .pair-uri { overflow-wrap: anywhere; }
-.dev-actions { margin-top: 12px; }
-.dev-actions button.danger { background: transparent; border: 1px solid var(--amber); color: var(--amber); }
+.candidate-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 2px; }
 
-/* Click-for-detail fleet cards + detail modal (LAN-signal theme). */
-.card.clickable { cursor: pointer; }
-.card.clickable:hover, .card.clickable:focus-visible { border-color: var(--teal); outline: none;
-  box-shadow: 0 0 16px rgba(45, 212, 191, 0.25); }
-.hint.subtle { opacity: 0.75; }
-.hint.warn { color: var(--amber); }
-.modal-backdrop { position: fixed; inset: 0; background: rgba(8, 12, 16, 0.72); z-index: 50;
-  display: flex; align-items: flex-start; justify-content: center; padding: 32px 16px; overflow-y: auto; }
-.modal-card { max-width: 560px; width: 100%; border-color: var(--teal);
-  box-shadow: 0 0 32px rgba(45, 212, 191, 0.3); }
-.modal-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
-.modal-head h2 { margin: 0; overflow-wrap: anywhere; }
-.kv { display: flex; flex-direction: column; gap: 10px; margin: 14px 0; padding: 0; }
-.kv > div { border-top: 1px solid var(--line); padding-top: 8px; }
-.kv dt { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 2px; }
-.kv dd { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
-
-/* Usage tab (additive — Devices tab untouched). Donut is pure SVG, no deps. */
-.usage-top { display: grid; grid-template-columns: minmax(0, 380px) minmax(0, 1fr); gap: 14px; }
-@media (max-width: 860px) { .usage-top { grid-template-columns: 1fr; } }
+/* Donut (pure SVG, no chart library). */
 .donut-wrap { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
 .donut-total { fill: var(--text); font-size: 22px; font-weight: 700; font-family: var(--sans); }
 .donut-sub { fill: var(--muted); font-size: 11px; font-family: var(--mono); }
 .legend { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 8px; }
-.strip { display: flex; gap: 2px; margin: 6px 0 4px; }
-.strip .seg { flex: 1 1 0; height: 26px; border-radius: 4px; border: 1px solid var(--line); min-width: 0; }
-.meter { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
-.bar { height: 8px; background: var(--panel2); border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
-.bar > i { display: block; height: 100%; background: var(--teal); }
-.usage-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; margin-top: 12px; }
+
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+/* Focus rings stay visible for keyboard users on every interactive surface. */
+:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+
+/* Motion answers user action only, and never when the reader asked for calm. */
+@media (prefers-reduced-motion: reduce) {
+  .typing { animation: none; }
+  .mark { box-shadow: none; }
+  * { scroll-behavior: auto !important; }
+}

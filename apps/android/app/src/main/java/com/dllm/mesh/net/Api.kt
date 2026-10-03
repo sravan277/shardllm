@@ -14,14 +14,14 @@ import java.util.concurrent.TimeUnit
 /**
  * Thrown when the coordinator answers 404 for an endpoint the app expects
  * (sessions rename/delete, usage, plan). Callers translate this into a
- * "coordinator needs upgrade" toast and an honest empty state — never a crash.
+ * "coordinator needs upgrade" toast and an honest empty state â€” never a crash.
  */
 class CoordinatorNeedsUpgradeException(message: String) : IOException(message)
 
 /**
- * Thrown when the coordinator answers 403 for a group-scoped usage query
- * (not a member / non-admin). Carries the totals-only [summary] parsed out
- * of the 403 body so the UI can still show honest totals instead of nothing.
+ * Thrown when the coordinator answers 403 for a usage query. Carries the
+ * totals-only [summary] parsed out of the 403 body so the UI can still show
+ * honest totals instead of nothing.
  */
 class UsageForbiddenException(
     message: String,
@@ -84,35 +84,55 @@ data class UsageSummary(
 )
 
 /**
- * One private group from `GET /v1/networks`.
- * Tolerates old + new shapes: id/group_id, member_count/members size.
+ * One row of `GET /v1/devices` â€” the mesh's single registry of paired devices.
+ *
+ * WHY this exists (replacing the removed per-network device lists): the mesh is
+ * one network now, so a device has exactly one home. Fields are split by
+ * *authority*:
+ * - registry authority (deviceId â€¦ lastSeen) comes from `/v1/devices`
+ * - load/worker/layer fields come from `/v1/usage` + `/v1/plan`, because the
+ *   registry deliberately reports no load numbers; every load field is nullable
+ *   and the UI must render "not reporting" rather than a synthesised zero.
+ *
+ * [deviceName] stays null when the device never sent one â€” the server does not
+ * invent a fallback, and neither does this client; the UI shows a short id.
  */
-data class MeshNetwork(
-    val id: String,
-    val name: String,
-    val openJoin: Boolean,
-    val hasPassword: Boolean,
-    val memberCount: Int?,
-    val createdAt: String?,
-)
-
-/** One member row from `GET /v1/networks/{id}/devices`. */
-data class NetworkDevice(
+data class MeshDevice(
     val deviceId: String,
     val deviceName: String?,
     val role: String?,
-    val active: Boolean,
+    /** `paired` | `revoked`; null when the row predates the field. */
     val status: String?,
+    /** True when last_seen is inside the coordinator's 90s activity window. */
+    val active: Boolean,
+    /** Raw ISO-8601 UTC timestamp as stored by the coordinator. */
     val lastSeen: String?,
+    val pairedAt: String?,
+    val cpuPct: Double? = null,
+    val memPct: Double? = null,
+    /** `live` | `reported` | `none` â€” provenance of cpu/mem. */
+    val loadSource: String = "none",
+    /** Heartbeat `worker_active`; null = the device has never reported it. */
+    val workerActive: Boolean? = null,
+    /** Layers actually assigned by `/v1/plan`; null = no assignment reported. */
+    val assignedLayers: List<Int>? = null,
+    /** Layers the device *offered* in its heartbeat; null = never offered. */
+    val offeredLayers: List<Int>? = null,
+    /** True for this phone's own row (matches the saved node_id). */
+    val isSelf: Boolean = false,
 ) {
-    val connected: Boolean get() = active && status != "revoked"
+    /** A revoked row must never be shown as a healthy mesh member. */
+    val revoked: Boolean get() = status == "revoked"
+
+    /** Registry-liveness AND not revoked â€” what "online in the mesh" means. */
+    val online: Boolean get() = active && !revoked
 }
 
 /**
- * Coordinator REST surface used by the chat-list + usage overhaul.
+ * Coordinator REST surface used by the chat-list + usage + devices screens.
  * SSE streaming stays in [SseClient]; this object owns the plain JSON calls.
  *
- * Contract (backend crew implements in parallel — code against exactly this):
+ * Contract (code against exactly this):
  * - `GET /v1/sessions` entries: {id/session_id, model, tokens_out,
  *   last_token_at, title}
  * - `POST /v1/sessions/{id}/rename` {title} -> {ok:true,id,title}
@@ -121,6 +141,12 @@ data class NetworkDevice(
  * - `GET /v1/usage` -> {tokens_out_total, sessions_total, per_device[],
  *   plan:{stages}, bandwidth:null}
  * - `GET /v1/plan` -> {plan_id, stages[]}
+ * - `GET /v1/devices` -> {devices:[{device_id,device_name,role,permissions,
+ *   status,active,last_seen,paired_at,paired_by}]} (bare array also accepted)
+ * - `POST /v1/devices/{id}/approve` | `/revoke` -> {ok:true}
+ *   (404 unknown device)
+ * - `DELETE /v1/devices/{id}` -> {ok:true,id} (404 unknown; 400 when the id is
+ *   the coordinator's own row â€” the server refuses to orphan the mesh)
  *
  * Every call throws [CoordinatorNeedsUpgradeException] on HTTP 404 so the UI
  * can toast "coordinator needs upgrade" and render an honest empty state.
@@ -191,23 +217,23 @@ object DllmApi {
             }
         }
 
+    /**
+     * `GET /v1/usage`, optionally narrowed to this phone's own row.
+     *
+     * WHY no group parameter: the mesh is a single network now, so the group
+     * query parameter (and its 403 "not a member" path) no longer has a meaning
+     * this client can express. [deviceId] remains because "my share" is still a
+     * real question the Usage tab asks.
+     */
     suspend fun getUsage(
         baseUrl: String,
-        groupId: String? = null,
         deviceId: String? = null,
     ): UsageSummary =
         withContext(Dispatchers.IO) {
             val path = buildString {
                 append("/v1/usage")
-                val q = ArrayList<String>(2)
-                if (!groupId.isNullOrBlank()) {
-                    q.add("group=${urlEncode(groupId.trim())}")
-                }
                 if (!deviceId.isNullOrBlank()) {
-                    q.add("device_id=${urlEncode(deviceId.trim())}")
-                }
-                if (q.isNotEmpty()) {
-                    append("?").append(q.joinToString("&"))
+                    append("?device_id=").append(urlEncode(deviceId.trim()))
                 }
             }
             val url = "${baseUrl.trimEnd('/')}$path"
@@ -221,12 +247,12 @@ object DllmApi {
                     )
                 }
                 if (resp.code == 403) {
-                    // Group-scoped denial still carries honest totals in the
-                    // body (backend contract) — surface them instead of nothing.
+                    // A denial still carries honest totals in the body
+                    // (backend contract) â€” surface them instead of nothing.
                     val totals = runCatching { parseUsage(body) }.getOrNull()
                         ?: UsageSummary(0, 0, emptyList(), emptyList())
                     throw UsageForbiddenException(
-                        "not a group member (GET $path -> HTTP 403)",
+                        "not permitted (GET $path -> HTTP 403)",
                         totals,
                     )
                 }
@@ -246,7 +272,7 @@ object DllmApi {
     /**
      * Best-effort stop: `POST /v1/sessions/{id}/stop`. The local
      * `streamJob.cancel()` in the ViewModel is the real cancel; this tells
-     * the coordinator to stop decoding too. Unknown/stale servers 404 —
+     * the coordinator to stop decoding too. Unknown/stale servers 404 â€”
      * treated as stopped (local cancel already happened).
      */
     suspend fun stopSession(baseUrl: String, id: String) =
@@ -263,176 +289,110 @@ object DllmApi {
             }
         }
 
-    // ---- networks (private groups, all LAN-visible) -------------------------
-    //
-    // Contract (backend crew implements in parallel — code against exactly this):
-    // - `GET /v1/networks` -> {networks:[{id,name,open_join,has_password,
-    //   member_count,created_at}]} (bare array also accepted)
-    // - `POST /v1/networks` {name,password?,open_join} -> {id,...} (400 bad name)
-    // - `GET /v1/networks/{id}/devices` -> {devices:[{device_id,device_name,
-    //   role,active,status,last_seen}]}; also accepts {paired:[...],
-    //   active_now:[...]} (activeNow derived from `active` otherwise)
-    // - `POST /v1/networks/{id}/join` {device_id,password?,qr_secret?}
-    //   -> {ok:true} (403 wrong password, 404 unknown group)
-    // - `POST /v1/networks/{id}/leave` {device_id} -> {ok:true}
+    // ---- devices (the mesh is a single registry) -----------------------------
 
-    suspend fun listNetworks(baseUrl: String): List<MeshNetwork> =
+    /**
+     * `GET /v1/devices` — every paired device the coordinator knows about.
+     *
+     * This is the only device list the app has: the mesh is one network, so a
+     * device has one row here and there is no per-group enumeration to walk.
+     * Load numbers are NOT in this response by design (see [MeshDevice]); the
+     * caller merges them from `GET /v1/usage`.
+     */
+    suspend fun listDevices(baseUrl: String): List<MeshDevice> =
         withContext(Dispatchers.IO) {
-            val text = getOrThrow(baseUrl, "/v1/networks")
-            parseNetworks(text)
+            val text = getOrThrow(baseUrl, "/v1/devices")
+            parseDevices(text)
         }
 
-    suspend fun createNetwork(
+    /**
+     * `POST /v1/devices/{id}/approve` — re-admit a revoked row.
+     * 404 for an unknown id is surfaced as a [CoordinatorNeedsUpgradeException]
+     * only when the endpoint itself is missing; a real "unknown device" 404 is
+     * reported by the generic branch below with its body so the UI can say so.
+     */
+    suspend fun approveDevice(baseUrl: String, deviceId: String) =
+        deviceStatusAction(baseUrl, deviceId, "approve", "approved")
+
+    /** `POST /v1/devices/{id}/revoke` — mark a row revoked (it stops contributing). */
+    suspend fun revokeDevice(baseUrl: String, deviceId: String) =
+        deviceStatusAction(baseUrl, deviceId, "revoke", "revoked")
+
+    private suspend fun deviceStatusAction(
         baseUrl: String,
-        name: String,
-        password: String?,
-        openJoin: Boolean,
-    ): MeshNetwork = withContext(Dispatchers.IO) {
-        val url = "${baseUrl.trimEnd('/')}/v1/networks"
-        val payload = JSONObject()
-            .put("name", name)
-            .put("open_join", openJoin)
-        if (!password.isNullOrEmpty()) payload.put("password", password)
-        val req = Request.Builder()
-            .url(url)
-            .post(payload.toString().toRequestBody("application/json".toMediaType()))
-            .build()
-        val text = http.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) {
-                val body = resp.body?.string().orEmpty()
-                throw IOException("POST $url -> HTTP ${resp.code} $body")
-            }
-            resp.body?.string().orEmpty()
-        }
-        parseNetworks(text).firstOrNull()
-            ?: parseSingleNetwork(text)
-            ?: throw IOException("Empty network from $url")
-    }
-
-    suspend fun getNetworkDevices(baseUrl: String, id: String): List<NetworkDevice> =
-        withContext(Dispatchers.IO) {
-            val text = getOrThrow(baseUrl, "/v1/networks/$id/devices")
-            parseNetworkDevices(text)
-        }
-
-    suspend fun joinNetwork(
-        baseUrl: String,
-        id: String,
         deviceId: String,
-        password: String?,
-        qrSecret: String?,
-        deviceName: String? = null,
+        action: String,
+        pastTense: String,
     ) = withContext(Dispatchers.IO) {
-        val url = "${baseUrl.trimEnd('/')}/v1/networks/$id/join"
-        val payload = JSONObject().put("device_id", deviceId)
-        if (!deviceName.isNullOrBlank()) payload.put("device_name", deviceName)
-        if (!password.isNullOrEmpty()) payload.put("password", password)
-        if (!qrSecret.isNullOrEmpty()) payload.put("qr_secret", qrSecret)
+        val url = "${baseUrl.trimEnd('/')}/v1/devices/$deviceId/$action"
         val req = Request.Builder()
             .url(url)
-            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .post("{}".toRequestBody("application/json".toMediaType()))
             .build()
         http.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) {
-                val body = resp.body?.string().orEmpty()
-                throw IOException("POST $url -> HTTP ${resp.code} $body")
-            }
+            if (resp.isSuccessful) return@withContext
+            val body = resp.body?.string().orEmpty()
+            throw IOException("device $pastTense failed: HTTP ${resp.code} $body")
         }
     }
 
-    suspend fun leaveNetwork(baseUrl: String, id: String, deviceId: String) =
+    /**
+     * `DELETE /v1/devices/{id}` — hard-delete the row.
+     *
+     * WHY the 400 is special: the coordinator refuses to delete its own row
+     * ("never orphan the mesh"), and that refusal is the *correct* answer, not
+     * a bug. The UI must show it verbatim rather than pretending it worked, so
+     * the body is carried through in the message.
+     */
+    suspend fun deleteDevice(baseUrl: String, deviceId: String) =
         withContext(Dispatchers.IO) {
-            val url = "${baseUrl.trimEnd('/')}/v1/networks/$id/leave"
-            val payload = JSONObject().put("device_id", deviceId).toString()
-            val req = Request.Builder()
-                .url(url)
-                .post(payload.toRequestBody("application/json".toMediaType()))
-                .build()
+            val url = "${baseUrl.trimEnd('/')}/v1/devices/$deviceId"
+            val req = Request.Builder().url(url).delete().build()
             http.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    val body = resp.body?.string().orEmpty()
-                    throw IOException("POST $url -> HTTP ${resp.code} $body")
-                }
+                if (resp.isSuccessful) return@withContext
+                val body = resp.body?.string().orEmpty()
+                throw IOException("delete refused: HTTP ${resp.code} $body")
             }
         }
 
-    fun parseNetworks(text: String): List<MeshNetwork> {
+    /**
+     * Parses `GET /v1/devices`: `{devices:[...]}`, a bare array, or a single
+     * row. Rows without an id are skipped rather than rendered as blank cards.
+     * No field is invented — a missing name stays null so the UI can fall back
+     * to a short id instead of showing a fabricated "Unknown device".
+     */
+    fun parseDevices(text: String): List<MeshDevice> {
         val arr: JSONArray = runCatching {
             val trimmed = text.trim()
             if (trimmed.startsWith("[")) JSONArray(trimmed)
-            else JSONObject(trimmed).optJSONArray("networks") ?: JSONArray()
+            else JSONObject(trimmed).optJSONArray("devices")
+                ?: if (trimmed.startsWith("{") && trimmed.contains("\"device_id\"")) {
+                    JSONArray().put(JSONObject(trimmed))
+                } else {
+                    JSONArray()
+                }
         }.getOrNull() ?: JSONArray()
-        val out = ArrayList<MeshNetwork>(arr.length())
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            parseSingleNetwork(o)?.let { out.add(it) }
-        }
-        return out
-    }
-
-    private fun parseSingleNetwork(text: String): MeshNetwork? = runCatching {
-        val o = JSONObject(text.trim())
-        val inner = o.optJSONObject("network") ?: o
-        parseSingleNetwork(inner)
-    }.getOrNull()
-
-    private fun parseSingleNetwork(o: JSONObject): MeshNetwork? {
-        val id = o.optString("id").ifBlank { o.optString("group_id") }
-        if (id.isBlank()) return null
-        val name = o.optString("name").trim().ifBlank { id }
-        val openJoin = o.optBoolean("open_join", true)
-        val hasPassword = when {
-            !o.isNull("has_password") -> o.optBoolean("has_password", false)
-            !o.isNull("password_hash") -> o.optString("password_hash").isNotBlank()
-            else -> false
-        }
-        val memberCount = when {
-            !o.isNull("member_count") -> o.optInt("member_count").takeIf { it >= 0 }
-            !o.isNull("members") -> o.optJSONArray("members")?.length()
-            else -> null
-        }
-        val createdAt = o.optString("created_at").trim().ifBlank { null }
-        return MeshNetwork(id, name, openJoin, hasPassword, memberCount, createdAt)
-    }
-
-    /** Accepts `{devices:[...]}` or `{paired:[...],active_now:[...]}` shapes. */
-    fun parseNetworkDevices(text: String): List<NetworkDevice> {
-        val obj = runCatching { JSONObject(text.trim()) }.getOrNull()
-            ?: return emptyList()
-        val arr: JSONArray = obj.optJSONArray("devices")
-            ?: run {
-                val paired = obj.optJSONArray("paired") ?: JSONArray()
-                val activeNow = obj.optJSONArray("active_now") ?: JSONArray()
-                val merged = JSONArray()
-                for (i in 0 until paired.length()) {
-                    merged.put(paired.optJSONObject(i) ?: continue)
-                }
-                for (i in 0 until activeNow.length()) {
-                    val o = activeNow.optJSONObject(i) ?: continue
-                    // active_now entries may be id strings — normalize to objects.
-                    merged.put(o)
-                }
-                merged
-            }
-        val out = ArrayList<NetworkDevice>(arr.length())
+        val out = ArrayList<MeshDevice>(arr.length())
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             val id = o.optString("device_id")
                 .ifBlank { o.optString("id").ifBlank { o.optString("node_id") } }
             if (id.isBlank()) continue
             out.add(
-                NetworkDevice(
+                MeshDevice(
                     deviceId = id,
                     deviceName = o.optString("device_name").trim().ifBlank { null },
                     role = o.optString("role").trim().ifBlank { null },
-                    active = o.optBoolean("active", false),
                     status = o.optString("status").trim().ifBlank { null },
+                    active = o.optBoolean("active", false),
                     lastSeen = o.optString("last_seen").trim().ifBlank { null },
+                    pairedAt = o.optString("paired_at").trim().ifBlank { null },
                 )
             )
         }
         return out
     }
+
 
     /** Accepts `{sessions:[...]}` or a bare array; skips entries without id. */
     fun parseSessions(text: String): List<ChatSession> {
@@ -529,7 +489,7 @@ object DllmApi {
     /**
      * Parses the heartbeat `layers` value from a usage entry: a JSON array
      * of layer ints (the phone's offer, e.g. 0-27), or an object with
-     * `layer_start`/`layer_end`. Null when absent — never synthesized.
+     * `layer_start`/`layer_end`. Null when absent â€” never synthesized.
      */
     private fun parseLayersValue(v: Any?): List<Int>? {
         if (v == null || v == JSONObject.NULL) return null

@@ -20,11 +20,17 @@
 //! - `DELETE /v1/devices/{id}` (hard delete; 404 unknown; 400 self —
 //!   never orphan the mesh)
 //! - `POST /v1/devices/heartbeat` (optional device_name/load/capabilities)
+//! - `POST /v1/devices/{id}/calibrate` (measured decode_tps/bandwidth/
+//!   kv_budget land in the registry so `plan_layers` stops seeing constants)
+//! - `GET /v1/mesh` (live QUIC links + allow-list count; `rtt_us` is `null`
+//!   until a real sample exists)
 //!
 //! NOTE: never put `CompressionLayer` / `BufferLayer` in front of the SSE
 //! route — it breaks streaming. `Store` calls below are tiny Phase 0 writes
 //! done inline; production paths MUST wrap them in `spawn_blocking`
 //! (see `dllm-store` docs). Phase 0 serves mock tokens only.
+
+pub mod mesh;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,9 +44,10 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use dllm_core::{DeviceSpec, Engine, plan_layers};
 use dllm_core::plan::TOTAL_LAYERS;
+use dllm_core::{DeviceSpec, Engine, PipelinePlan, StageRange, plan_layers};
 use dllm_store::Store;
+use mesh::MeshState;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tower_http::services::{ServeDir, ServeFile};
@@ -114,6 +121,12 @@ pub struct AppState {
     pub http_port: u16,
     /// Live generations per session for stop support.
     pub gen_runs: Mutex<HashMap<String, GenRun>>,
+    /// Live mTLS QUIC mesh (peer links + allow-list). Defaults to an unbound
+    /// [`MeshState`] so single-node callers need no mesh setup; `dllm serve`
+    /// passes the same instance it handed to
+    /// [`mesh::spawn_mesh_server`] so `GET /v1/mesh` and `GET /api/stats`
+    /// report the real links.
+    pub mesh: Arc<MeshState>,
 }
 
 /// Stable node identity surfaced via `GET /api/node` (pairing bootstrap).
@@ -238,11 +251,31 @@ pub fn new_state_with_node(
 }
 
 /// Build shared state with explicit node identity + HTTP port.
+///
+/// The mesh stays unbound ([`MeshState::new`]); use
+/// [`new_state_with_mesh`] when the caller also runs
+/// [`mesh::spawn_mesh_server`] and wants `GET /v1/mesh` to show real links.
 pub fn new_state_with_node_and_port(
     engine: Arc<dyn Engine>,
     store: Arc<Store>,
     node: NodeInfo,
     http_port: u16,
+) -> Arc<AppState> {
+    new_state_with_mesh(engine, store, node, http_port, MeshState::new())
+}
+
+/// Build shared state with explicit node identity + HTTP port + a live
+/// [`MeshState`].
+///
+/// Pass the *same* `mesh` that was handed to
+/// [`mesh::spawn_mesh_server`], otherwise `GET /v1/mesh` reports an unbound
+/// mesh and `/api/stats` shows zero peers even while links are open.
+pub fn new_state_with_mesh(
+    engine: Arc<dyn Engine>,
+    store: Arc<Store>,
+    node: NodeInfo,
+    http_port: u16,
+    mesh: Arc<MeshState>,
 ) -> Arc<AppState> {
     let (tx, _rx) = broadcast::channel(256);
     let engine_kind = EngineKind::from_engine(&engine);
@@ -258,6 +291,7 @@ pub fn new_state_with_node_and_port(
         started: Instant::now(),
         http_port,
         gen_runs: Mutex::new(HashMap::new()),
+        mesh,
     })
 }
 
@@ -277,6 +311,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/devices/{id}", get(device_detail).delete(delete_device))
         .route("/v1/devices/{id}/approve", post(approve_device))
         .route("/v1/devices/{id}/revoke", post(revoke_device))
+        .route("/v1/devices/{id}/calibrate", post(calibrate_device))
         .route("/v1/networks", get(list_networks).post(create_network))
         .route("/v1/networks/{id}", get(get_network))
         .route("/v1/networks/{id}/devices", get(network_devices))
@@ -289,6 +324,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/sessions/{id}/stop", post(stop_session))
         .route("/v1/plan", get(get_plan))
         .route("/v1/usage", get(get_usage))
+        .route("/v1/mesh", get(mesh_status))
         .route("/v1/sessions/{id}/messages", post(post_message))
         .route("/v1/sessions/{id}/events", get(session_events))
         // Static web UI (built dist). Run the exe from the workspace root so
@@ -369,12 +405,17 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     // Phase 0: tiny inline reads (see crate docs on the blocking contract).
     let sessions = state.store.count_sessions().unwrap_or(0);
     let events = state.store.count_events().unwrap_or(0);
+    let mesh = state.mesh.summary();
     Json(serde_json::json!({
         "uptime_s": state.started.elapsed().as_secs(),
         "engine": state.engine_kind.as_str(),
         "sessions": sessions,
         "events": events,
         "node_id": state.node.node_id,
+        "mesh": {
+            "peers_connected": mesh.peers_connected,
+            "allowed_peers": mesh.allowed_peers,
+        },
     }))
 }
 
@@ -388,6 +429,30 @@ async fn models() -> impl IntoResponse {
 
 async fn node_info(State(state): State<Arc<AppState>>) -> Json<NodeInfo> {
     Json(state.node.clone())
+}
+
+/// `GET /v1/mesh`: live QUIC link state, honest about what is unknown.
+///
+/// - `quic_port` / `endpoint` describe the **bound** socket: `quic_port` is
+///   `0` and `endpoint` is `"unbound"` when the mesh failed to bind (HTTP
+///   still serves; see [`mesh::spawn_mesh_server`]).
+/// - `peers` is one entry per accepted connection. `rtt_us` stays `null`
+///   until a real round-trip sample exists and `device_name` stays `null`
+///   when the peer never reported a hostname — neither is ever invented.
+///   A closed link stays in the list with `connected:false` for forensics.
+/// - `allowed_peer_count` = registry rows currently eligible for the
+///   mTLS allow-list (paired + has a certificate fingerprint).
+async fn mesh_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    // Phase 0 inline read; production: spawn_blocking.
+    let peers = state.mesh.peers(&state.store);
+    let allowed_peer_count = state.mesh.allowed_peer_count();
+    let quic_port = state.mesh.bound_port();
+    Json(serde_json::json!({
+        "quic_port": quic_port,
+        "endpoint": state.mesh.endpoint(),
+        "peers": peers,
+        "allowed_peer_count": allowed_peer_count,
+    }))
 }
 
 /// Rank for a candidate LAN IPv4 (lower = better). Home WiFi `192.168/16`
@@ -781,6 +846,170 @@ async fn delete_device(
     }
 }
 
+/// Body of `POST /v1/devices/{id}/calibrate`. Every field is optional, but at
+/// least one must be present and in range — a calibration that carries no
+/// measurement is rejected rather than silently clearing the registry.
+#[derive(Debug, Default, Deserialize)]
+struct CalibrateReq {
+    /// Measured batch-1 full-model decode throughput (tok/s).
+    #[serde(default)]
+    decode_tps: Option<f64>,
+    /// Measured pairwise link bandwidth (Mbit/s).
+    #[serde(default)]
+    bandwidth_mbps: Option<f64>,
+    /// Measured KV budget for this device (MiB).
+    #[serde(default)]
+    kv_budget_mib: Option<f64>,
+    /// Measured per-layer decode time (ms); `device_spec_from_row`
+    /// converts it to `decode_tps` when `decode_tps` is absent.
+    #[serde(default)]
+    ms_per_layer_decode: Option<f64>,
+}
+
+/// Upper bound for `decode_tps` (tok/s). Far above any real LAN device; a
+/// larger value is a unit error (ms reported as s), not a measurement.
+const CALIBRATE_MAX_DECODE_TPS: f64 = 10_000.0;
+/// Upper bound for `ms_per_layer_decode` (ms/layer).
+const CALIBRATE_MAX_MS_PER_LAYER: f64 = 10_000.0;
+/// Upper bound for `bandwidth_mbps` (Mbit/s) — 100 Gbit/s.
+const CALIBRATE_MAX_BANDWIDTH_MBPS: f64 = 100_000.0;
+/// Upper bound for `kv_budget_mib` (1 TiB).
+const CALIBRATE_MAX_KV_BUDGET_MIB: u64 = 1 << 20;
+
+/// Validate one optional positive-in-range measurement.
+fn calibrate_number(
+    field: &'static str,
+    value: Option<f64>,
+    max: f64,
+) -> Result<Option<f64>, String> {
+    let Some(v) = value else { return Ok(None) };
+    if !v.is_finite() {
+        return Err(format!("{field} must be a finite number"));
+    }
+    if v <= 0.0 {
+        return Err(format!("{field} must be > 0"));
+    }
+    if v > max {
+        return Err(format!("{field} must be <= {max}"));
+    }
+    Ok(Some(v))
+}
+
+/// `POST /v1/devices/{id}/calibrate`: persist measured capabilities so
+/// [`device_spec_from_row`] feeds [`plan_layers`] real numbers instead of the
+/// 16.6 / 1000 / 1024 constants. The submitted fields are **merged** into any
+/// existing capabilities JSON (a heartbeat-reported `kv_pages` survives), and
+/// `ms_per_layer_decode` is dropped when the same body carries `decode_tps`
+/// so the two can never disagree.
+///
+/// 404 unknown device; 400 for an empty body or an out-of-range / negative /
+/// non-finite measurement (a bad calibration is rejected, never clamped).
+async fn calibrate_device(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<CalibrateReq>,
+) -> impl IntoResponse {
+    let bad = |msg: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": msg })),
+        )
+    };
+    // Phase 0 inline read/write; production: spawn_blocking.
+    let row = match state.store.get_device(&id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "unknown device" })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+            );
+        }
+    };
+    let decode_tps = match calibrate_number("decode_tps", body.decode_tps, CALIBRATE_MAX_DECODE_TPS) {
+        Ok(v) => v,
+        Err(msg) => return bad(msg),
+    };
+    let ms_per_layer = match calibrate_number(
+        "ms_per_layer_decode",
+        body.ms_per_layer_decode,
+        CALIBRATE_MAX_MS_PER_LAYER,
+    ) {
+        Ok(v) => v,
+        Err(msg) => return bad(msg),
+    };
+    let bandwidth_mbps = match calibrate_number(
+        "bandwidth_mbps",
+        body.bandwidth_mbps,
+        CALIBRATE_MAX_BANDWIDTH_MBPS,
+    ) {
+        Ok(v) => v,
+        Err(msg) => return bad(msg),
+    };
+    let kv_budget_mib = match body.kv_budget_mib {
+        None => None,
+        Some(v) if !v.is_finite() => return bad("kv_budget_mib must be a finite number".into()),
+        Some(v) if v < 1.0 => return bad("kv_budget_mib must be >= 1".into()),
+        Some(v) if v > CALIBRATE_MAX_KV_BUDGET_MIB as f64 => {
+            return bad(format!("kv_budget_mib must be <= {CALIBRATE_MAX_KV_BUDGET_MIB}"))
+        }
+        Some(v) => Some(v.round() as u64),
+    };
+    if decode_tps.is_none()
+        && ms_per_layer.is_none()
+        && bandwidth_mbps.is_none()
+        && kv_budget_mib.is_none()
+    {
+        return bad("at least one of decode_tps / ms_per_layer_decode / bandwidth_mbps / kv_budget_mib required".into());
+    }
+    let mut caps: serde_json::Map<String, serde_json::Value> = row
+        .capabilities
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    // decode_tps and ms_per_layer_decode are two encodings of one measurement,
+    // so only the winner is stored — they can never disagree downstream.
+    match (decode_tps, ms_per_layer) {
+        (Some(t), _) => {
+            caps.insert("decode_tps".into(), serde_json::json!(t));
+            caps.remove("ms_per_layer_decode");
+        }
+        (None, Some(ms)) => {
+            caps.insert("ms_per_layer_decode".into(), serde_json::json!(ms));
+            caps.remove("decode_tps");
+        }
+        (None, None) => {}
+    }
+    if let Some(v) = bandwidth_mbps {
+        caps.insert("bandwidth_mbps".into(), serde_json::json!(v));
+    }
+    if let Some(v) = kv_budget_mib {
+        caps.insert("kv_budget_mib".into(), serde_json::json!(v));
+    }
+    let caps_value = serde_json::Value::Object(caps);
+    let caps_json = caps_value.to_string();
+    match state.store.set_device_capabilities(&id, Some(&caps_json)) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "device_id": id, "capabilities": caps_value })),
+        ),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "unknown device" })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        ),
+    }
+}
+
 /// Canonical network QR string (single source of truth):
 /// `dllm://net?g=<id>&h=<secret-hint>&p=<has-password 0/1>&fp=<fingerprint>&v=<version>#s=<secret>`
 /// where `h` is the first 8 chars of the secret (hint, not the secret) and
@@ -801,6 +1030,11 @@ pub fn network_qr(network_id: &str, qr_secret: &str, has_password: bool, fingerp
 /// - else the bench baseline 16.6 tok/s (see `docs/bench-baseline.json`).
 /// `bandwidth_mbps` from `capabilities.bandwidth_mbps` else 1000.
 /// `kv_budget_mib` from `capabilities.kv_budget_mib` else 1024.
+///
+/// The fallbacks apply only to devices that were **never calibrated** — send
+/// `POST /v1/devices/{id}/calibrate` (or a heartbeat `capabilities` object)
+/// to replace them with measurements, and `plan_layers` will move the layer
+/// split accordingly.
 fn device_spec_from_row(row: &dllm_store::DeviceRow, fallback_id: &str) -> DeviceSpec {
     let caps: Option<serde_json::Value> = row
         .capabilities
@@ -831,8 +1065,14 @@ fn device_spec_from_row(row: &dllm_store::DeviceRow, fallback_id: &str) -> Devic
                 bandwidth_mbps = bw;
             }
         }
+        // Accept `512` and `512.0` alike: clients serialise whole MiB either
+        // way and a float must not silently fall back to the 1024 baseline.
         if let Some(kv) = c.get("kv_budget_mib").and_then(|v| v.as_u64()) {
             kv_budget_mib = kv;
+        } else if let Some(kv) = c.get("kv_budget_mib").and_then(|v| v.as_f64()) {
+            if kv.is_finite() && kv >= 1.0 {
+                kv_budget_mib = kv.round() as u64;
+            }
         }
     }
     let id = if row.device_id.is_empty() {
@@ -910,6 +1150,49 @@ fn stage_map_for(
         }
     }
     m
+}
+
+/// Serialize one planned stage for `/v1/plan` and `/v1/usage`.
+///
+/// `latency_ms` is **always explicit `null`**: a per-stage latency is
+/// `compute + one activation hop`, and stage execution is not wired yet
+/// (ADR-028), so any number here would be fabricated. Clients can rely on the
+/// key being present and nullable. `stage` is omitted when the caller does
+/// not want the positional index (`/v1/usage` mirrors the plan without it).
+fn plan_stage_json(
+    stage_index: Option<usize>,
+    device_id: &str,
+    range: &StageRange,
+) -> serde_json::Value {
+    let mut v = serde_json::Map::new();
+    if let Some(i) = stage_index {
+        v.insert("stage".into(), serde_json::json!(i));
+    }
+    v.insert("device_id".into(), serde_json::json!(device_id));
+    v.insert("layer_start".into(), serde_json::json!(range.start));
+    v.insert("layer_end".into(), serde_json::json!(range.end));
+    v.insert("latency_ms".into(), serde_json::Value::Null);
+    serde_json::Value::Object(v)
+}
+
+/// Serialize a whole plan's stages, pairing each range with the device at the
+/// same position in `device_ids_in_order`.
+fn plan_stages_json(
+    plan: &PipelinePlan,
+    device_ids_in_order: &[String],
+    with_index: bool,
+) -> Vec<serde_json::Value> {
+    plan.stages
+        .iter()
+        .enumerate()
+        .map(|(i, range)| {
+            plan_stage_json(
+                with_index.then_some(i),
+                device_ids_in_order.get(i).map(String::as_str).unwrap_or_default(),
+                range,
+            )
+        })
+        .collect()
 }
 
 /// `GET /v1/devices/{id}`: full registry row + honest load + sessions +
@@ -1172,15 +1455,19 @@ async fn rename_session(
     )
 }
 
-/// `GET /v1/plan[?group=]`: pipeline plan via [`plan_layers`].
-/// - No `group`: global candidates (self + active `worker_active` peers).
-///   Single-device (self only) keeps the legacy `{plan_id:1, note}` shape
-///   so old clients/tests stay green; multi-device returns the
-///   `plan_layers` id + stages (balanced-split fallback lives inside
-///   `plan_layers`).
+/// `GET /v1/plan[?group=]`: pipeline plan via [`plan_layers`] — never a
+/// hardcoded constant.
+/// - Both the single-device and multi-device cases call [`plan_layers`] with
+///   the candidates' [`DeviceSpec`]s, so `plan_id` is the planner's real
+///   membership hash and every layer boundary is computed (a single device
+///   yields one stage covering `0..TOTAL_LAYERS-1` inside `plan_layers`).
+/// - `latency_ms` is explicit `null` per stage and `bottleneck` explicit
+///   `null`: both need a live pipeline, and stage execution is not wired yet
+///   (ADR-028).
+/// - `note` distinguishes the single-device case for old clients; it is
+///   informational only.
 /// - With `?group=<id>`: candidates scoped to that network's paired+active
 ///   members (self + `worker_active` peers in the group); 404 unknown group.
-///   Always returns the `plan_layers` shape (never hardcoded self 0-27).
 #[derive(Debug, Default, Deserialize)]
 struct PlanQuery {
     #[serde(default)]
@@ -1232,72 +1519,46 @@ async fn get_plan(
         // No synthesis: only plan over real rows (missing = not planned).
         let cands = pipeline_candidates(scoped, &state.node.node_id, now_ms);
         // If the group has no worker_active peers yet, still plan self alone
-        // when self is a member (single-stage 0-27 via plan_layers).
+        // (single stage 0-27 via plan_layers).
         let plan = compute_pipeline_plan(&cands, &state.node.node_id);
         let ids: Vec<String> = cands.iter().map(|r| r.device_id.clone()).collect();
-        let stages: Vec<serde_json::Value> = plan
-            .stages
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                serde_json::json!({
-                    "stage": i,
-                    "device_id": ids.get(i).cloned().unwrap_or_default(),
-                    "layer_start": s.start,
-                    "layer_end": s.end,
-                })
-            })
-            .collect();
         return (
             StatusCode::OK,
             Json(serde_json::json!({
                 "plan_id": plan.plan_id,
                 "group": gid,
-                "stages": stages,
+                "stages": plan_stages_json(&plan, &ids, true),
+                "bottleneck": serde_json::Value::Null,
+                "note": single_device_note(cands.len()),
             })),
         );
     }
     // Global (legacy) path.
     let all = state.store.list_devices().unwrap_or_default();
     let cands = pipeline_candidates(all, &state.node.node_id, now_ms);
-    if cands.len() <= 1 {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "plan_id": 1,
-                "stages": [{
-                    "stage": 0,
-                    "device_id": state.node.node_id,
-                    "layer_start": 0,
-                    "layer_end": 27,
-                }],
-                "note": "single-device fast path",
-            })),
-        );
-    }
+    // Same planner for every arity: no hardcoded `plan_id: 1` / `0-27`.
     let plan = compute_pipeline_plan(&cands, &state.node.node_id);
     let ids: Vec<String> = cands.iter().map(|r| r.device_id.clone()).collect();
-    let stages: Vec<serde_json::Value> = plan
-        .stages
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            serde_json::json!({
-                "stage": i,
-                "device_id": ids.get(i).cloned().unwrap_or_default(),
-                "layer_start": s.start,
-                "layer_end": s.end,
-            })
-        })
-        .collect();
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "plan_id": plan.plan_id,
-            "stages": stages,
-            "note": "multi-device plan via plan_layers",
+            "stages": plan_stages_json(&plan, &ids, true),
+            "bottleneck": serde_json::Value::Null,
+            "note": single_device_note(cands.len()),
         })),
     )
+}
+
+/// Informational `note` for `/v1/plan`: at most one candidate means the
+/// coordinator runs every layer itself. The numbers still come from
+/// [`plan_layers`] — this string is never load-bearing.
+fn single_device_note(candidate_count: usize) -> &'static str {
+    if candidate_count <= 1 {
+        "single-device fast path"
+    } else {
+        "multi-device plan via plan_layers"
+    }
 }
 
 /// `GET /v1/usage[?group=]`: usage roll-up for the web dashboard Usage tab.
@@ -1490,18 +1751,9 @@ async fn get_usage(
         let plan = compute_pipeline_plan(&cands, &state.node.node_id);
         let ids: Vec<String> = cands.iter().map(|r| r.device_id.clone()).collect();
         let smap = stage_map_for(&plan, &ids);
-        let plan_stages: Vec<serde_json::Value> = plan
-            .stages
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                serde_json::json!({
-                    "device_id": ids.get(i).cloned().unwrap_or_default(),
-                    "layer_start": s.start,
-                    "layer_end": s.end,
-                })
-            })
-            .collect();
+        // Same serializer as /v1/plan (minus the positional index): the
+        // numbers come from plan_layers, never from a hardcoded 0-27.
+        let plan_stages: Vec<serde_json::Value> = plan_stages_json(&plan, &ids, false);
         if !is_admin {
             // Non-admin member: totals only, no per-device breakdown.
             return (
@@ -1559,25 +1811,8 @@ async fn get_usage(
             usage_entry(r, &state.node.node_id, now_ms, tokens_out_total, sessions_total, st)
         })
         .collect();
-    let plan_stages: Vec<serde_json::Value> = if cands.len() <= 1 {
-        vec![serde_json::json!({
-            "device_id": state.node.node_id,
-            "layer_start": 0,
-            "layer_end": 27,
-        })]
-    } else {
-        plan.stages
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                serde_json::json!({
-                    "device_id": ids.get(i).cloned().unwrap_or_default(),
-                    "layer_start": s.start,
-                    "layer_end": s.end,
-                })
-            })
-            .collect()
-    };
+    // Single-device included: the stage list is always the planner's output.
+    let plan_stages: Vec<serde_json::Value> = plan_stages_json(&plan, &ids, false);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2630,10 +2865,19 @@ mod tests {
             .await
             .expect("oneshot");
         let v = body_json(res).await;
-        assert_eq!(v["plan_id"], 1);
+        // plan_id is the planner's real membership hash, not a constant:
+        // single-device now goes through plan_layers like every other arity.
+        let expected = plan_layers(
+            TOTAL_LAYERS,
+            &[DeviceSpec::new("dllm-dev-1", 16.6, 1000.0, 1024)],
+        );
+        assert_eq!(v["plan_id"], expected.plan_id);
         assert_eq!(v["stages"][0]["device_id"], "dllm-dev-1");
         assert_eq!(v["stages"][0]["layer_start"], 0);
-        assert_eq!(v["stages"][0]["layer_end"], 27);
+        assert_eq!(v["stages"][0]["layer_end"], TOTAL_LAYERS - 1);
+        // Honest empties: no pipeline yet, so no latency and no bottleneck.
+        assert!(v["stages"][0]["latency_ms"].is_null());
+        assert!(v["bottleneck"].is_null());
         assert_eq!(v["note"], "single-device fast path");
 
         let res = app()
@@ -3537,6 +3781,286 @@ mod tests {
         let row = v["devices"].as_array().unwrap().iter().find(|d| d["device_id"] == "drill-pixel-8").expect("recreated");
         assert_eq!(row["status"], "paired");
         assert_eq!(row["active"], true);
+
+        cleanup(&path);
+    }
+
+    /// Real 64-hex certificate fingerprint (the shape a paired device stores).
+    const FP_PEER: &str = "3f9a1c7e5b2d4081a6c0e9f3b7d15a2846c0e9f3b7d15a2846c0e9f3b7d15a2";
+
+    /// `GET /v1/mesh` on a node that has never bound the mesh: honest empties.
+    /// No connection is fabricated — `peers` is legitimately empty and
+    /// `quic_port` is `0`, while `allowed_peer_count` comes from the registry.
+    #[tokio::test]
+    async fn mesh_endpoint_is_honest_when_unbound_and_counts_allowed_peers() {
+        let path = temp_db("mesh-empty");
+        let store = Arc::new(Store::open(&path).expect("open store"));
+        seed_self(&store, "dllm-dev-1");
+        // An HTTP-heartbeat-only device (no cert_fp) must NOT be mesh-eligible.
+        let res = router(new_state(Arc::new(MockEngine::new()), store.clone()))
+            .oneshot(post_json(
+                "/v1/devices/heartbeat",
+                serde_json::json!({"device_id": "http-only"}),
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(res.status(), StatusCode::OK);
+        // A properly paired device with a certificate fingerprint.
+        store
+            .upsert_device("paired-1", "worker", "[]", FP_PEER, "dllm-dev-1")
+            .unwrap();
+        store.set_device_name("paired-1", Some("pixel-8")).unwrap();
+        store.touch_last_seen("paired-1").unwrap();
+
+        let state = new_state(Arc::new(MockEngine::new()), store.clone());
+        // The mesh allow-list is a registry projection, so populate it the way
+        // spawn_mesh_server does (bind is the only part we skip).
+        state.mesh.refresh_allow_list(&store);
+        let app = || router(state.clone());
+
+        let (status, v) = get_json(&app(), "/v1/mesh").await;
+        assert_eq!(status, StatusCode::OK);
+        // Not listening -> no invented port/endpoint.
+        assert_eq!(v["quic_port"], 0);
+        assert_eq!(v["endpoint"], "unbound");
+        assert!(v["peers"].as_array().unwrap().is_empty());
+        // seed_self (cert_fp "fp-self") + paired-1; http-only has none.
+        assert_eq!(v["allowed_peer_count"], 2);
+
+        // Paired device is resolvable; the heartbeat-only one is not.
+        assert_eq!(
+            state.mesh.resolve_device_id(FP_PEER).as_deref(),
+            Some("paired-1")
+        );
+        assert!(state.mesh.resolve_device_id("").is_none());
+
+        // /api/stats summarises the same numbers.
+        let (_, s) = get_json(&app(), "/api/stats").await;
+        assert_eq!(s["mesh"]["peers_connected"], 0);
+        assert_eq!(s["mesh"]["allowed_peers"], 2);
+
+        cleanup(&path);
+    }
+
+    /// Calibration lands in the registry and **changes the plan**: a 3x
+    /// faster peer must receive more layers than an identical device. This is
+    /// the assertion that the planner is no longer fed the 16.6/1000/1024
+    /// constants for every device.
+    #[tokio::test]
+    async fn calibration_changes_the_plan_layer_split() {
+        let path = temp_db("calibrate");
+        let store = Arc::new(Store::open(&path).expect("open store"));
+        seed_self(&store, "dllm-dev-1");
+        let state = new_state(Arc::new(MockEngine::new()), store.clone());
+        let app = || router(state.clone());
+
+        // A second eligible device: worker_active makes it a pipeline candidate.
+        let res = app()
+            .oneshot(post_json(
+                "/v1/devices/heartbeat",
+                serde_json::json!({"device_id": "peer-1", "worker_active": true}),
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Uncalibrated: both devices fall back to the 16.6 baseline -> an even
+        // split, identical no matter what happens later.
+        let (status, before) = get_json(&app(), "/v1/plan").await;
+        assert_eq!(status, StatusCode::OK);
+        let before_stages = before["stages"].as_array().unwrap().clone();
+        assert_eq!(before_stages.len(), 2);
+        let before_self = (
+            before_stages[0]["layer_start"].as_u64().unwrap(),
+            before_stages[0]["layer_end"].as_u64().unwrap(),
+        );
+        assert_eq!(before_self, (0, 13));
+
+        // Calibrate the peer at 3x the baseline throughput.
+        let res = app()
+            .oneshot(post_json(
+                "/v1/devices/peer-1/calibrate",
+                serde_json::json!({
+                    "decode_tps": 49.8,
+                    "bandwidth_mbps": 340.0,
+                    "kv_budget_mib": 512,
+                    "ms_per_layer_decode": 6.0,
+                }),
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["device_id"], "peer-1");
+        assert_eq!(v["capabilities"]["decode_tps"], 49.8);
+        assert_eq!(v["capabilities"]["bandwidth_mbps"], 340.0);
+        assert_eq!(v["capabilities"]["kv_budget_mib"], 512);
+        // decode_tps wins over ms_per_layer_decode: the pair can't disagree.
+        assert!(v["capabilities"].get("ms_per_layer_decode").is_none());
+
+        // Persisted, and visible in the registry detail.
+        let row = store.get_device("peer-1").unwrap().expect("row");
+        let caps: serde_json::Value = serde_json::from_str(&row.capabilities.unwrap()).unwrap();
+        assert_eq!(caps["decode_tps"], 49.8);
+        let (_, detail) = get_json(&app(), "/v1/devices/peer-1").await;
+        assert_eq!(detail["device"]["capabilities"]["decode_tps"], 49.8);
+
+        // The plan actually moved: the fast peer takes the larger share.
+        let (_, after) = get_json(&app(), "/v1/plan").await;
+        let after_stages = after["stages"].as_array().unwrap().clone();
+        assert_eq!(after_stages.len(), 2);
+        assert_eq!(after_stages[0]["device_id"], "dllm-dev-1");
+        assert_eq!(after_stages[1]["device_id"], "peer-1");
+        let after_self = (
+            after_stages[0]["layer_start"].as_u64().unwrap(),
+            after_stages[0]["layer_end"].as_u64().unwrap(),
+        );
+        let after_peer = (
+            after_stages[1]["layer_start"].as_u64().unwrap(),
+            after_stages[1]["layer_end"].as_u64().unwrap(),
+        );
+        assert_ne!(before_stages, after_stages, "calibration must move the plan");
+        assert_ne!(before_self, after_self);
+        // Contiguous, full coverage, and the fast device holds more layers.
+        assert_eq!(after_peer.0, after_self.1 + 1);
+        assert_eq!(after_self.0, 0);
+        assert_eq!(after_peer.1, (TOTAL_LAYERS - 1) as u64);
+        let self_len = after_self.1 - after_self.0 + 1;
+        let peer_len = after_peer.1 - after_peer.0 + 1;
+        assert!(peer_len > self_len, "3x faster peer must get more layers");
+        assert_eq!(self_len + peer_len, TOTAL_LAYERS as u64);
+        // Honest empties survive the change.
+        assert!(after["bottleneck"].is_null());
+        for s in &after_stages {
+            assert!(s["latency_ms"].is_null());
+        }
+
+        // /v1/usage mirrors the same planner output.
+        let (_, usage) = get_json(&app(), "/v1/usage").await;
+        assert_eq!(usage["plan"]["stages"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            usage["plan"]["stages"][1]["layer_end"],
+            after_peer.1
+        );
+        assert!(usage["plan"]["stages"][0]["latency_ms"].is_null());
+
+        cleanup(&path);
+    }
+
+    /// Calibration validation: out-of-range, negative, non-finite, empty and
+    /// unknown-device bodies are rejected; nothing is clamped or invented.
+    #[tokio::test]
+    async fn calibrate_rejects_bad_ranges_and_merges_into_existing_caps() {
+        let path = temp_db("calibrate-bad");
+        let store = Arc::new(Store::open(&path).expect("open store"));
+        seed_self(&store, "dllm-dev-1");
+        // Pre-existing heartbeat-reported capability must survive calibration.
+        store
+            .set_device_capabilities("dllm-dev-1", Some(r#"{"kv_pages":8}"#))
+            .unwrap();
+        let state = new_state(Arc::new(MockEngine::new()), store.clone());
+        let app = || router(state.clone());
+
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"decode_tps": -1.0}),
+            serde_json::json!({"decode_tps": 0.0}),
+            serde_json::json!({"decode_tps": 1e12}),
+            serde_json::json!({"ms_per_layer_decode": -0.5}),
+            serde_json::json!({"bandwidth_mbps": 0.0}),
+            serde_json::json!({"bandwidth_mbps": 1e9}),
+            serde_json::json!({"kv_budget_mib": 0}),
+            serde_json::json!({"kv_budget_mib": -512}),
+            serde_json::json!({"kv_budget_mib": 1e18}),
+        ] {
+            let res = app()
+                .oneshot(post_json("/v1/devices/dllm-dev-1/calibrate", bad.clone()))
+                .await
+                .expect("oneshot");
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "body {bad}");
+            assert_eq!(body_json(res).await["ok"], false);
+        }
+        // None of the rejected writes touched the row.
+        let row = store.get_device("dllm-dev-1").unwrap().expect("row");
+        let caps: serde_json::Value = serde_json::from_str(&row.capabilities.unwrap()).unwrap();
+        assert_eq!(caps["kv_pages"], 8);
+        assert!(caps.get("decode_tps").is_none());
+
+        // Unknown device -> 404 (never invent a row).
+        let res = app()
+            .oneshot(post_json(
+                "/v1/devices/ghost/calibrate",
+                serde_json::json!({"decode_tps": 20.0}),
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // Partial calibration merges: kv_pages survives, ms_per_layer_decode
+        // is stored on its own when decode_tps is absent.
+        let res = app()
+            .oneshot(post_json(
+                "/v1/devices/dllm-dev-1/calibrate",
+                serde_json::json!({"ms_per_layer_decode": 6.0}),
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["capabilities"]["kv_pages"], 8);
+        assert_eq!(v["capabilities"]["ms_per_layer_decode"], 6.0);
+        // ms_per_layer_decode alone resolves decode_tps = 1000/(ms*28).
+        let row = store.get_device("dllm-dev-1").unwrap().expect("row");
+        let spec = device_spec_from_row(&row, "dllm-dev-1");
+        assert!((spec.decode_tps - (1000.0 / (6.0 * TOTAL_LAYERS as f64))).abs() < 1e-9);
+
+        // A float kv_budget_mib is accepted (clients serialise 512.0 too).
+        let res = app()
+            .oneshot(post_json(
+                "/v1/devices/dllm-dev-1/calibrate",
+                serde_json::json!({"kv_budget_mib": 768.0, "bandwidth_mbps": 900.0}),
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await["capabilities"]["kv_budget_mib"], 768);
+        let row = store.get_device("dllm-dev-1").unwrap().expect("row");
+        let spec = device_spec_from_row(&row, "dllm-dev-1");
+        assert_eq!(spec.kv_budget_mib, 768);
+        assert!((spec.bandwidth_mbps - 900.0).abs() < 1e-9);
+
+        cleanup(&path);
+    }
+
+    /// `AppState` always carries a mesh: the default is unbound (safe for
+    /// tests + single-node callers) and `new_state_with_mesh` shares the live
+    /// instance with `spawn_mesh_server`.
+    #[tokio::test]
+    async fn app_state_mesh_defaults_unbound_and_shares_a_bound_instance() {
+        let path = temp_db("mesh-state");
+        let store = Arc::new(Store::open(&path).expect("open store"));
+        let state = new_state(Arc::new(MockEngine::new()), store.clone());
+        assert_eq!(state.mesh.bound_port(), 0);
+        assert_eq!(state.mesh.endpoint(), "unbound");
+        assert_eq!(state.mesh.summary().peers_connected, 0);
+        // A failed bind must not stop HTTP: the router still answers.
+        let (status, v) = get_json(&router(state.clone()), "/api/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["ok"], true);
+
+        let mesh = MeshState::new();
+        let shared = new_state_with_mesh(
+            Arc::new(MockEngine::new()),
+            store,
+            NodeInfo::default(),
+            8080,
+            mesh.clone(),
+        );
+        assert!(Arc::ptr_eq(&shared.mesh, &mesh));
+        mesh.set_bound_port(9999);
+        assert_eq!(shared.mesh.bound_port(), 9999);
+        assert_eq!(shared.mesh.endpoint(), "0.0.0.0:9999");
 
         cleanup(&path);
     }

@@ -52,21 +52,21 @@ import com.dllm.mesh.net.normalizeBaseUrl
 import com.dllm.mesh.net.parseJoinPayload
 import com.dllm.mesh.net.parsePairUri
 import com.dllm.mesh.net.splitHostPort
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 
-private val Teal = Color(0xFF2DD4BF)
-private val Muted = Color(0xFF93A1B0)
-private val Ink = Color(0xFFE8EDF2)
-private val Amber = Color(0xFFF5B544)
+private const val HEARTBEAT_INTERVAL_MS = 30_000L
 
 data class PairTestResult(
     val healthOk: Boolean,
@@ -79,6 +79,23 @@ data class PairTestResult(
     val nodeError: String = "",
 )
 
+/**
+ * Pairing *and* connection orchestration.
+ *
+ * WHY this ViewModel owns connecting: pairing and being connected used to be
+ * three separate user actions (scan → Test → Send request → Use as server →
+ * Connect), each of which could be forgotten individually, and a user who did
+ * the first two still saw a dead chat. Pairing is now a one-time event and
+ * connecting is a consequence: the primitives ([SseClient.getHealth],
+ * [Presence.postHeartbeat]) all existed, they just had nothing tying them
+ * together. So every path that changes the coordinator — scan, manual entry,
+ * a LAN peer, app launch — ends in the same [connect] routine, and there is
+ * exactly one place where "connected" is decided.
+ *
+ * Only one of this ViewModel and [DevicesViewModel] is alive at a time (the
+ * NavHost disposes the non-visible destination), so the two never run competing
+ * heartbeat loops against the same coordinator.
+ */
 class PairingViewModel(application: Application) : AndroidViewModel(application) {
 
     private val store = IdentityStore(application)
@@ -102,14 +119,45 @@ class PairingViewModel(application: Application) : AndroidViewModel(application)
     private val _testResult = MutableStateFlow<PairTestResult?>(null)
     val testResult: StateFlow<PairTestResult?> = _testResult.asStateFlow()
 
+    /**
+     * True once the coordinator answered /api/health AND this phone's heartbeat
+     * was accepted — the two conditions that together mean "I can actually chat
+     * from here". Reset to false the moment either stops being true.
+     */
+    private val _connected = MutableStateFlow(false)
+    val connected: StateFlow<Boolean> = _connected.asStateFlow()
+
+    private var heartbeatJob: Job? = null
+
     private val discovery = NsdDiscovery(application)
     val nearbyPeers: StateFlow<List<Peer>> = discovery.peers
 
     init {
         viewModelScope.launch { store.ensureNodeId() }
+        viewModelScope.launch {
+            val id = store.ensureNodeId()
+            advertise(id)
+        }
+        // Zero taps to be connected after the first successful pairing: if a
+        // coordinator was really persisted (not the placeholder default), verify
+        // it and announce this phone on launch. A first run with nothing saved
+        // must stay quiet rather than probing 192.168.1.10 and reporting a
+        // failure the user never caused.
+        viewModelScope.launch {
+            if (!store.hasCoordinator.first()) {
+                _status.value = "No coordinator saved yet — scan, enter one, or tap Nearby."
+                return@launch
+            }
+            connect()
+        }
     }
 
-    /** Handles a QR scan: `dllm://pair?...` URIs, plus legacy join-JSON fallback. */
+    /**
+     * Handles a QR scan: `dllm://pair?...` URIs, plus a legacy join-JSON
+     * fallback. There is no group code any more — the mesh is a single network,
+     * so a `dllm://net?...` code is simply unreadable and the user is told what
+     * to re-show rather than being half-joined.
+     */
     // Identity: scan NEVER rotates node_id — it only ensures one exists.
     fun applyScanned(raw: String) {
         val pair = parsePairUri(raw)
@@ -126,6 +174,9 @@ class PairingViewModel(application: Application) : AndroidViewModel(application)
                 _status.value = "Paired to http://$host:${pair.port}" +
                     (if (pair.fingerprint.isNotBlank()) " — fingerprint pinned." else " — no fingerprint in code.") +
                     (hostWarning(host)?.let { " Warning: $it" } ?: "")
+                // Pairing is the one-time event; connecting follows immediately
+                // so the user's first action already produces a working chat.
+                connect()
             }
             return
         }
@@ -141,6 +192,7 @@ class PairingViewModel(application: Application) : AndroidViewModel(application)
                 }
                 _testResult.value = null
                 _status.value = "Coordinator set to ${legacy.url} (legacy join code)."
+                connect()
             }
             return
         }
@@ -151,9 +203,14 @@ class PairingViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch { saveManualSync(host, portText, fingerprint) }
     }
 
+    /**
+     * Manual entry that also connects. Saving without connecting would leave the
+     * user staring at a saved-but-dead server, which is the exact confusion this
+     * screen is being fixed for.
+     */
     fun saveAndTest(host: String, portText: String, fingerprint: String) {
         viewModelScope.launch {
-            if (saveManualSync(host, portText, fingerprint)) testServerSync()
+            if (saveManualSync(host, portText, fingerprint)) connect()
         }
     }
 
@@ -206,6 +263,39 @@ class PairingViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch { testServerSync() }
     }
 
+    /**
+     * The single connect routine: verify the coordinator, then announce this
+     * phone. Returns quietly on failure with the reason in [status] — every
+     * caller (launch, scan, manual save, peer tap, Reconnect button) funnels
+     * through here so "connected" always means the same thing.
+     */
+    fun connect() {
+        viewModelScope.launch { connectSync() }
+    }
+
+    /**
+     * One-tap recovery for a phone that was connected and then lost the
+     * coordinator (laptop slept, WiFi roamed). Restarts the whole sequence —
+     * test + heartbeat — rather than only re-pinging, because a phone can pass
+     * a health check and still fail to register if the coordinator restarted
+     * with an empty registry.
+     */
+    fun reconnect() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+        _connected.value = false
+        _status.value = "Reconnecting…"
+        connect()
+    }
+
+    /** Stop heartbeating; this phone goes idle on the coordinator after ~90s. */
+    fun disconnect() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+        _connected.value = false
+        _status.value = "Disconnected — this phone will go idle on the coordinator."
+    }
+
     /** Start LAN browsing for `_dllm._tcp.` coordinators (shown in NEARBY). */
     fun startNearby() {
         discovery.startDiscovery()
@@ -217,42 +307,50 @@ class PairingViewModel(application: Application) : AndroidViewModel(application)
     }
 
     override fun onCleared() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
         discovery.stopDiscovery()
         discovery.unregisterService()
     }
 
     /**
-     * Send a pair request to a discovered coordinator: announce this phone
-     * via its heartbeat endpoint. The coordinator lists the phone as
-     * paired+active, so its website shows it under "Active now".
-     * Role + load + capabilities come from [Presence] (worker when the
-     * toggle is on, else client).
+     * One tap on a discovered coordinator: adopt it as the server, verify it and
+     * announce this phone, all in a single action.
+     *
+     * WHY this replaced the two-step "Send request" then "Use as server": both
+     * buttons did part of the same job — the first heartbeat against a peer
+     * registers this phone there, and the second only wrote the URL. Split, they
+     * allowed the half-state where a phone had announced itself to a coordinator
+     * it was not using. A discovered peer is reachable by construction, so there
+     * is nothing for the user to decide between.
      */
-    fun sendPairRequest(peer: Peer) {
-        viewModelScope.launch {
-            runCatching {
-                Presence.postHeartbeat(getApplication(), "http://${peer.host}:${peer.port}")
-            }.onSuccess {
-                _status.value = "Pair request sent to ${peer.serviceName} (${peer.host}:${peer.port}) — " +
-                    "it now lists this phone as paired+active. " +
-                    "To use it here, tap Use as server, then open Networks → Refresh."
-            }.onFailure { e ->
-                _status.value = "Pair request failed: ${e.message ?: e::class.simpleName}. " +
-                    "Fix: same WiFi as the coordinator, no AP isolation, then scan again."
-            }
-        }
-    }
-
-    /** Adopt a discovered coordinator as this phone's server (no pin change). */
     // Identity: adopting a server NEVER rotates node_id.
-    fun usePeerAsServer(peer: Peer) {
+    fun connectViaPeer(peer: Peer) {
         viewModelScope.launch {
             val base = "http://${peer.host}:${peer.port}"
             store.ensureNodeId()
             store.setCoordinatorUrl(base)
             _testResult.value = null
-            _status.value = "Server set to $base (${peer.serviceName}). Tap Test below to verify."
+            _status.value = "Connecting to $base (${peer.serviceName})…"
+            connectSync()
         }
+    }
+
+    /**
+     * Advertise this phone on the LAN so a laptop browsing `_dllm._tcp.` sees it
+     * without the phone having to pair first. Best-effort inside
+     * [NsdDiscovery.registerService]; failure is silent because a missing
+     * advertisement is invisible to the user and not actionable.
+     */
+    private suspend fun advertise(deviceId: String) {
+        val workerOn = store.workerEnabled.first()
+        discovery.registerService(
+            txt = mapOf(
+                "node_id" to deviceId,
+                "role" to if (workerOn) "worker" else "client",
+                "worker" to workerOn.toString(),
+            ),
+        )
     }
 
     /**
@@ -269,11 +367,77 @@ class PairingViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private suspend fun testServerSync() {
+    /**
+     * Verify then announce: GET /api/health (+ optional /api/node for identity
+     * and the TOFU comparison) followed by one heartbeat that creates/refreshes
+     * this phone's registry row.
+     *
+     * WHY the heartbeat is not optional: health only proves *something* answers
+     * at that URL. A fresh install is not in the coordinator's registry until it
+     * announces itself, and an unregistered device cannot be assigned pipeline
+     * layers. Running both means a successful [connected] state always implies
+     * "chat works AND the mesh knows this phone exists".
+     */
+    private suspend fun connectSync(): Boolean {
+        val base = normalizeBaseUrl(store.coordinatorUrl.first())
+        val healthy = testServerSync()
+        if (!healthy) {
+            _connected.value = false
+            return false
+        }
+        val beat = runCatching { Presence.postHeartbeat(getApplication(), base) }
+        if (beat.isFailure) {
+            _connected.value = false
+            _status.value = "$base answered health but rejected this phone: " +
+                "${Presence.friendlyCause(beat.exceptionOrNull()!!)}. " +
+                "Fix: check the server is running with the same device_id, then Reconnect."
+            return false
+        }
+        _connected.value = true
+        _status.value = "Connected to $base — this phone is registered and active."
+        startHeartbeatLoop(base)
+        return true
+    }
+
+    /**
+     * Keep the registry row warm: re-announce every 30s, comfortably inside the
+     * coordinator's 90s activity window so a single dropped packet never makes
+     * the phone look gone.
+     *
+     * A failed tick stops the loop and clears [connected] rather than retrying
+     * silently — the UI must be able to say "this phone is not currently
+     * connected", and a background retry would make that untrue. [reconnect] is
+     * the user's one tap back.
+     */
+    private fun startHeartbeatLoop(base: String) {
+        heartbeatJob?.cancel()
+        heartbeatJob = viewModelScope.launch {
+            while (isActive) {
+                delay(HEARTBEAT_INTERVAL_MS)
+                val tick = runCatching { Presence.postHeartbeat(getApplication(), base) }
+                if (tick.isFailure) {
+                    _connected.value = false
+                    _status.value = "Heartbeat to $base lost: " +
+                        "${Presence.friendlyCause(tick.exceptionOrNull()!!)}. " +
+                        "Tap Reconnect to retry."
+                    break
+                }
+            }
+            heartbeatJob = null
+        }
+    }
+
+    /**
+     * Runs the verification half of [connectSync]. Returns true only when
+     * /api/health answered, so callers can decide whether announcing makes
+     * sense. /api/node stays best-effort: older coordinators 404 it and that is
+     * not a reason to call the server unusable.
+     */
+    private suspend fun testServerSync(): Boolean {
         val base = normalizeBaseUrl(store.coordinatorUrl.first())
         if (base.isBlank()) {
             _status.value = "No server configured — pair first."
-            return
+            return false
         }
         _testing.value = true
         _testResult.value = null
@@ -283,7 +447,7 @@ class PairingViewModel(application: Application) : AndroidViewModel(application)
         if (healthErr != null) {
             _status.value = "Health check failed: ${connectionFix(base, healthErr)}"
             _testing.value = false
-            return
+            return false
         }
         val expected = store.serverFingerprint.first()
         val node = runCatching { sse.getNodeInfo(base) }
@@ -311,6 +475,7 @@ class PairingViewModel(application: Application) : AndroidViewModel(application)
             }
         }
         _testing.value = false
+        return true
     }
 
     /**
@@ -356,6 +521,7 @@ fun PairingScreen(
     val testing by viewModel.testing.collectAsState()
     val testResult by viewModel.testResult.collectAsState()
     val nearbyPeers by viewModel.nearbyPeers.collectAsState()
+    val connected by viewModel.connected.collectAsState()
     var reuseId by remember { mutableStateOf("") }
 
     var section by remember { mutableStateOf(PairSection.NONE) }
@@ -375,26 +541,67 @@ fun PairingScreen(
     Column(
         modifier = modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState()),
     ) {
-        Text("Paired server", color = Ink)
+        Text("Paired server", color = MeshColors.Text)
         Spacer(Modifier.height(4.dp))
-        Text(serverUrl, color = Teal)
+        Text(serverUrl, color = MeshColors.Teal)
         Text(
             if (expectedFp.isNotBlank()) "Pinned fp: $expectedFp" else "No fingerprint pinned yet.",
-            color = Muted,
+            color = MeshColors.Muted,
         )
-        if (serverNodeId.isNotBlank()) Text("node_id: $serverNodeId", color = Muted)
+        if (serverNodeId.isNotBlank()) Text("node_id: $serverNodeId", color = MeshColors.Muted)
         Spacer(Modifier.height(12.dp))
+
+        // Connection state lives at the top because it is the only thing the
+        // user actually needs most of the time: after the first pairing this
+        // screen opens already connected, and the whole screen collapses to a
+        // single Reconnect tap when it is not.
+        Card(
+            colors = CardDefaults.cardColors(
+                containerColor = if (connected) MeshColors.PanelActive else MeshColors.Panel,
+            ),
+        ) {
+            Column(Modifier.fillMaxWidth().padding(12.dp)) {
+                Text(
+                    if (connected) "● Connected" else "○ Not connected",
+                    color = if (connected) MeshColors.Teal else MeshColors.Muted,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    if (connected) {
+                        "This phone is verified and registered on $serverUrl."
+                    } else {
+                        "Tap Reconnect to verify the server and announce this phone."
+                    },
+                    color = MeshColors.Muted,
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = viewModel::reconnect,
+                        enabled = !testing,
+                        modifier = Modifier.weight(1f),
+                    ) { Text(if (testing) "Connecting…" else "Reconnect") }
+                    if (connected) {
+                        OutlinedButton(
+                            onClick = viewModel::disconnect,
+                            modifier = Modifier.weight(1f),
+                        ) { Text("Disconnect") }
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(16.dp))
 
         // This phone's stable identity — full ID + copy + "use existing" so a
         // stale duplicate row can be reconciled without reinstalling.
-        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B2B28))) {
+        Card(colors = CardDefaults.cardColors(containerColor = MeshColors.PanelActive)) {
             Column(Modifier.fillMaxWidth().padding(12.dp)) {
-                Text("This phone identity", color = Ink)
+                Text("This phone identity", color = MeshColors.Text)
                 Spacer(Modifier.height(4.dp))
                 SelectionContainer {
                     Text(
                         "device_id: ${myNodeId.ifBlank { "(loading…)" }}",
-                        color = Muted,
+                        color = MeshColors.Muted,
                     )
                 }
                 Spacer(Modifier.height(4.dp))
@@ -426,7 +633,7 @@ fun PairingScreen(
         Spacer(Modifier.height(16.dp))
 
         // Step 1 — pick a method first.
-        Text("Add a coordinator", color = Ink)
+        Text("Add a coordinator", color = MeshColors.Text)
         Spacer(Modifier.height(8.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(
@@ -447,26 +654,26 @@ fun PairingScreen(
         // Step 2 — the chosen method's own section.
         when (section) {
             PairSection.SCAN -> {
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF171D24))) {
+                Card(colors = CardDefaults.cardColors(containerColor = MeshColors.Panel)) {
                     Column(Modifier.fillMaxWidth().padding(12.dp)) {
-                        Text("Scan the QR shown by the coordinator.", color = Ink)
+                        Text("Scan the QR shown by the coordinator.", color = MeshColors.Text)
                         Spacer(Modifier.height(4.dp))
-                        Text("Codes look like dllm://pair?host=… (CameraX).", color = Muted)
+                        Text("Codes look like dllm://pair?host=… (CameraX).", color = MeshColors.Muted)
                         Spacer(Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(onClick = { showScan = true }) { Text("Open scanner") }
                             TextButton(onClick = { section = PairSection.NONE }) { Text("Back") }
                         }
                         Spacer(Modifier.height(4.dp))
-                        Text("No camera? The scanner also accepts pasted pair text.", color = Muted)
+                        Text("No camera? The scanner also accepts pasted pair text.", color = MeshColors.Muted)
                     }
                 }
                 Spacer(Modifier.height(12.dp))
             }
             PairSection.MANUAL -> {
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF171D24))) {
+                Card(colors = CardDefaults.cardColors(containerColor = MeshColors.Panel)) {
                     Column(Modifier.fillMaxWidth().padding(12.dp)) {
-                        Text("Manual entry", color = Ink)
+                        Text("Manual entry", color = MeshColors.Text)
                         Spacer(Modifier.height(8.dp))
                         OutlinedTextField(
                             value = hostField,
@@ -478,7 +685,7 @@ fun PairingScreen(
                         )
                         if (hostWarn != null) {
                             Spacer(Modifier.height(4.dp))
-                            Text(hostWarn, color = Amber)
+                            Text(hostWarn, color = MeshColors.Amber)
                         }
                         Spacer(Modifier.height(8.dp))
                         OutlinedTextField(
@@ -518,36 +725,48 @@ fun PairingScreen(
                 Spacer(Modifier.height(12.dp))
             }
             PairSection.NEARBY -> {
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF171D24))) {
+                Card(colors = CardDefaults.cardColors(containerColor = MeshColors.Panel)) {
                     Column(Modifier.fillMaxWidth().padding(12.dp)) {
-                        Text("Coordinators on this WiFi LAN (${nearbyPeers.size})", color = Ink)
+                        Text("Coordinators on this WiFi LAN (${nearbyPeers.size})", color = MeshColors.Text)
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            "Send request announces this phone there; Use as server switches to it.",
-                            color = Muted,
+                            "One tap connects: the coordinator becomes this phone's server " +
+                                "and this phone announces itself there.",
+                            color = MeshColors.Muted,
                         )
                         Spacer(Modifier.height(8.dp))
                         if (nearbyPeers.isEmpty()) {
-                            Text("Nothing found yet — scanning…", color = Muted)
+                            Text("Nothing found yet — scanning…", color = MeshColors.Muted)
                             Spacer(Modifier.height(8.dp))
                         }
-                        nearbyPeers.forEach { peer ->
+                        // Other phones advertise themselves on the same service
+                        // type; they do not serve chat, so they are listed but not
+                        // offered as a connect target.
+                        val coordinators = nearbyPeers
+                            .filterNot { NsdDiscovery.isNodeAdvertisement(it.serviceName) }
+                        val otherPhones = nearbyPeers
+                            .filter { NsdDiscovery.isNodeAdvertisement(it.serviceName) }
+                        coordinators.forEach { peer ->
                             Row(
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Column(Modifier.weight(1f)) {
-                                    Text(peer.serviceName, color = Ink)
-                                    Text("${peer.host}:${peer.port}", color = Muted)
+                                    Text(peer.serviceName, color = MeshColors.Text)
+                                    Text("${peer.host}:${peer.port}", color = MeshColors.Muted)
                                 }
-                                TextButton(onClick = { viewModel.sendPairRequest(peer) }) {
-                                    Text("Send request")
-                                }
-                                TextButton(onClick = { viewModel.usePeerAsServer(peer) }) {
-                                    Text("Use as server")
+                                Button(onClick = { viewModel.connectViaPeer(peer) }) {
+                                    Text("Connect")
                                 }
                             }
+                        }
+                        if (otherPhones.isNotEmpty()) {
+                            Text(
+                                "Also on this LAN: ${otherPhones.size} phone(s) advertising " +
+                                    "presence only — pair to their coordinator instead.",
+                                color = MeshColors.Muted,
+                            )
                         }
                         Row {
                             TextButton(
@@ -561,38 +780,38 @@ fun PairingScreen(
             PairSection.NONE -> {}
         }
 
-        // Step 3 — verify.
-        Button(
-            onClick = viewModel::testServer,
-            enabled = !testing,
-            modifier = Modifier.fillMaxWidth(),
-        ) { Text(if (testing) "Testing…" else "Test") }
-        Spacer(Modifier.height(8.dp))
-
+        // Server details from the last verification. There is deliberately no
+        // standalone "Test" button any more: Reconnect at the top already runs
+        // the check *and* announces this phone, so a Test-only button could only
+        // ever produce a half-state — green health, no registry row.
         testResult?.let { result ->
-            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF171D24))) {
+            Card(colors = CardDefaults.cardColors(containerColor = MeshColors.Panel)) {
                 Column(Modifier.fillMaxWidth().padding(12.dp)) {
                     Text(
                         "Health: ${if (result.healthOk) "OK" else "FAILED"}",
-                        color = if (result.healthOk) Teal else Amber,
+                        color = if (result.healthOk) MeshColors.Teal else MeshColors.Amber,
                     )
                     if (result.nodeError.isNotBlank()) {
-                        Text("Node info unavailable: ${result.nodeError}", color = Muted)
+                        Text("Node info unavailable: ${result.nodeError}", color = MeshColors.Muted)
                     } else {
-                        if (result.nodeId.isNotBlank()) Text("node_id: ${result.nodeId}", color = Ink)
-                        if (result.version.isNotBlank()) Text("version: ${result.version}", color = Muted)
-                        result.quicPort?.let { Text("quic_port: $it", color = Muted) }
+                        if (result.nodeId.isNotBlank()) {
+                            Text("node_id: ${result.nodeId}", color = MeshColors.Text)
+                        }
+                        if (result.version.isNotBlank()) {
+                            Text("version: ${result.version}", color = MeshColors.Muted)
+                        }
+                        result.quicPort?.let { Text("quic_port: $it", color = MeshColors.Muted) }
                         if (result.serverFingerprint.isNotBlank()) {
-                            Text("Server fp: ${result.serverFingerprint}", color = Muted)
+                            Text("Server fp: ${result.serverFingerprint}", color = MeshColors.Muted)
                         }
                         when (result.fingerprintMatch) {
-                            true -> Text("Fingerprint: MATCH", color = Teal)
+                            true -> Text("Fingerprint: MATCH", color = MeshColors.Teal)
                             false -> Text(
                                 "Fingerprint: MISMATCH — TOFU warning, possible impersonation. " +
                                     "Re-pair only if you trust this server.",
-                                color = Amber,
+                                color = MeshColors.Amber,
                             )
-                            null -> Text("Fingerprint: no comparison available.", color = Muted)
+                            null -> Text("Fingerprint: no comparison available.", color = MeshColors.Muted)
                         }
                     }
                 }
@@ -600,12 +819,12 @@ fun PairingScreen(
             Spacer(Modifier.height(8.dp))
         }
 
-        if (status.isNotEmpty()) Text(status, color = Amber)
+        if (status.isNotEmpty()) Text(status, color = MeshColors.Amber)
     }
 
     if (showScan) {
         Dialog(onDismissRequest = { showScan = false }) {
-            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF101418))) {
+            Card(colors = CardDefaults.cardColors(containerColor = MeshColors.Ink)) {
                 if (cameraGranted) {
                     QrScanScreen(
                         onScanned = {
@@ -619,7 +838,7 @@ fun PairingScreen(
                     Column(Modifier.padding(16.dp)) {
                         Text(
                             "Camera permission not granted — grant it in Settings, or paste the pair text on the scan screen after granting.",
-                            color = Ink,
+                            color = MeshColors.Text,
                         )
                         TextButton(onClick = { showScan = false }) { Text("Close") }
                     }
