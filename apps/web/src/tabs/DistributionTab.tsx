@@ -92,10 +92,10 @@ export function DistributionTab({ data }: { data: Distribution }) {
         hint={
           measuredStages === 0
             ? "No stage has reported a latency sample yet."
-            : `${measuredStages} of ${(stages ?? []).length} stages report a measured latency. The slowest one is marked below.`
+            : `${measuredStages} of ${(stages ?? []).length} stages report a measured latency.`
         }
       >
-        <StageTiming stages={namedStages} bottleneck={data.plan?.bottleneck ?? null} />
+        <StageTiming stages={namedStages} bottleneck={null} />
       </Section>
 
       <Section

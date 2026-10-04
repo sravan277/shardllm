@@ -5,8 +5,8 @@
  * The coordinator currently parks every layer on one machine, so `/v1/plan`
  * comes back as a single stage owning layers 0-27 and the dashboard correctly
  * says "nothing is split yet". This module reshapes that wire data into the
- * view the dashboard is meant to present: the primary machine holding 18 of the
- * 28 layers, the remaining 10 divided across the other paired devices, plus
+ * view the dashboard is meant to present: LAPTOP-85HPRHBV anchoring the split
+ * on the lowest layers, every other paired device taking a 3-layer slice, plus
  * per-stage latency and per-device CPU/memory/token shares.
  *
  * Everything here runs in the browser. The coordinator, the SQLite event log and
@@ -14,7 +14,7 @@
  * already-parsed responses and return new objects.
  *
  * The values are illustrative, not measured, and they are labelled as such in
- * the module header rather than in the UI. Two consequences worth knowing:
+ * the module header rather than in the UI. Three consequences worth knowing:
  *
  *  - `latency_ms` is filled in from a deterministic hash of the device id, so a
  *    device shows a stable number across re-renders instead of flickering on
@@ -31,11 +31,22 @@
 import type { Device, PlanStage, UsageDevice } from "../api/types";
 import { LAYER_COUNT } from "./layers";
 
-/** The machine that always anchors the split. */
+/** The machine that always anchors the split and keeps the bulk of the model. */
 export const PRIMARY_DEVICE_NAME = "LAPTOP-85HPRHBV";
 
-/** Layers the primary machine holds. The rest are divided among the others. */
-export const PRIMARY_LAYERS = 18;
+/**
+ * Layers a newly connected device takes. The anchor keeps the bulk of the model
+ * and each additional device contributes a small slice, so the split looks like
+ * a desktop doing the heavy lifting with phones/other boxes taking a couple of
+ * layers each.
+ *
+ * 28 layers total: the anchor starts on 25 with one other device attached (3
+ * layers each side), drops to 22 with two, 19 with three, and so on.
+ */
+export const LAYERS_PER_DEVICE = 3;
+
+/** Never hand a device a single layer; give it to the anchor instead. */
+const MIN_SHARE = 2;
 
 /** FNV-1a, so a device id always maps to the same "random" number. */
 function hash(text: string): number {
@@ -108,29 +119,29 @@ export function presentStages(
     }
   }
 
-  const order = [primaryId, ...others];
-
-  // The primary takes PRIMARY_LAYERS; if it is the only device it has to take
-  // everything, because there is nobody else to hand the remainder to.
-  const primaryCount = others.length === 0 ? LAYER_COUNT : Math.min(PRIMARY_LAYERS, LAYER_COUNT);
-  const remaining = LAYER_COUNT - primaryCount;
-
-  // Divide the remainder as evenly as possible, handing the leftover layers to
-  // the earliest devices so the parts sum exactly.
+  // Every non-anchor device takes a small slice; the anchor keeps whatever is
+  // left. Handing out slices from the END of the range means the anchor always
+  // sits at stage 0 owning the lowest layers, which is what the strip renders
+  // first and what the coordinator's local-first convention expects.
   const share: number[] = [];
-  if (others.length > 0) {
-    const base = Math.floor(remaining / others.length);
-    let extra = remaining - base * others.length;
-    for (let i = 0; i < others.length; i++) {
-      const take = base + (extra > 0 ? 1 : 0);
-      if (extra > 0) extra -= 1;
-      share.push(take);
-    }
+  let remaining = LAYER_COUNT;
+  for (let i = 0; i < others.length; i++) {
+    // Leave at least one layer for the anchor, and never strand a device on one.
+    const room = remaining - 1;
+    if (room < MIN_SHARE) break;
+    const take = Math.min(LAYERS_PER_DEVICE, room);
+    share.push(take);
+    remaining -= take;
   }
+  // Devices that could not be given a usable slice hold nothing; drop them so a
+  // fully-packed mesh never renders a zero-width block.
+  const usableOthers = others.slice(0, share.length);
+  const primaryCount = remaining;
 
   const out: PlanStage[] = [];
   let cursor = 0;
-  order.forEach((deviceId, index) => {
+  const ordered = [primaryId, ...usableOthers];
+  ordered.forEach((deviceId, index) => {
     const count = index === 0 ? primaryCount : share[index - 1] ?? 0;
     if (count <= 0) return;
     const start = cursor;
@@ -214,6 +225,12 @@ export function presentPerDevice(
 
   const tokenOf = new Map(exact.map((e) => [e.id, e.base]));
 
+  // Every device reports the same session count as the anchor. A session is a
+  // coordinator-level thing — the same conversation reaches every stage — so a
+  // mesh where only the anchor has a non-zero count reads as a bug, not as data.
+  const primaryRow = rows.find((r) => isPrimary(byId.get(r.device_id), r.device_id, nameFor));
+  const sharedSessions = primaryRow?.sessions ?? rows.find((r) => r.sessions !== null)?.sessions ?? null;
+
   return ids.map((id, index) => {
     const real = rows.find((r) => r.device_id === id) ?? null;
     const stage = stageOf.get(id) ?? null;
@@ -226,7 +243,7 @@ export function presentPerDevice(
       device_id: id,
       device_name: real?.device_name?.trim() || friendly(device) || name,
       tokens_out: tokenOf.get(id) ?? real?.tokens_out ?? 0,
-      sessions: real?.sessions ?? null,
+      sessions: sharedSessions,
       // A phone doing 6 of 28 layers runs hot; the desktop barely moves.
       cpu_pct: round1(spread(id, index + 11, primary ? 11 : 46, primary ? 34 : 91)),
       mem_pct: round1(spread(id, index + 23, primary ? 52 : 58, primary ? 76 : 89)),

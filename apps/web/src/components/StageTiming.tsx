@@ -1,9 +1,9 @@
 /** Per-stage timing table.
  *
  * `latency_ms` is null on every stage until the coordinator measures one, and
- * `bottleneck` is null until a stage is actually identified as the slowest.
- * Both render as an explicit "not measured yet" instead of a zero or an
- * invented estimate.
+ * renders as an explicit "not measured yet" instead of a zero or an invented
+ * estimate. `bottleneck` is accepted and honoured when the coordinator names
+ * one; pass null to leave the slowest stage unmarked.
  */
 
 import { memo } from "react";
