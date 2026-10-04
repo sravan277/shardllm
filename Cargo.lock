@@ -565,6 +565,7 @@ dependencies = [
  "dllm-core",
  "dllm-net",
  "dllm-serve",
+ "dllm-shim",
  "dllm-store",
  "mdns-sd",
  "reqwest",
@@ -582,12 +583,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dllm-net",
+ "dllm-shim",
  "llama-cpp-2",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -616,6 +619,7 @@ dependencies = [
  "axum",
  "dllm-core",
  "dllm-net",
+ "dllm-shim",
  "dllm-store",
  "hostname",
  "quinn",
@@ -627,6 +631,18 @@ dependencies = [
  "tokio-stream",
  "tower",
  "tower-http 0.7.1",
+ "tracing",
+]
+
+[[package]]
+name = "dllm-shim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libloading",
+ "serde",
+ "serde_json",
+ "thiserror",
  "tracing",
 ]
 

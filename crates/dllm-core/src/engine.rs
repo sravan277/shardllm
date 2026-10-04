@@ -25,6 +25,135 @@ pub trait Engine: Send + Sync + 'static {
 
     /// Start a generation; tokens arrive on the returned channel.
     fn generate_stream(&self, prompt: String) -> mpsc::Receiver<TokenEvent>;
+
+    /// Which engine is actually behind this `dyn Engine`.
+    ///
+    /// Reported by `GET /api/stats` as `engine`. There used to be no such hook:
+    /// `dllm-serve` discriminated by `size_of_val(engine.as_ref())`, which
+    /// works only while every engine has a *distinct* size. `ShimEngine` is one
+    /// `Arc` — the same 8 bytes as `LlamaEngine` — so that heuristic would have
+    /// silently labelled a distributed shim session as `"llama"` and hidden
+    /// exactly the thing this repo is trying to prove. Implementations override
+    /// it; the default keeps the old heuristic so nothing that predates this
+    /// method changes behaviour.
+    fn flavor(&self) -> EngineFlavor {
+        // Legacy fallback: `LlamaEngine` is a single `Arc<LlamaInner>` (8 B on
+        // 64-bit), `MockEngine` a `Vec<String>` (24 B).
+        if std::mem::size_of_val(self) == std::mem::size_of::<Arc<()>>() {
+            EngineFlavor::Llama
+        } else {
+            EngineFlavor::Mock
+        }
+    }
+
+    /// Measured, prompt-free telemetry for `GET /api/stats` and `GET /v1/plan`.
+    ///
+    /// `None` means "this engine measures nothing about itself", which callers
+    /// render as an explicit `null` — never as zeros (ADR-024/030 discipline:
+    /// a null means not measured, not zero).
+    fn telemetry(&self) -> Option<EngineTelemetry> {
+        None
+    }
+}
+
+/// Which engine implementation is live. Mirrors `dllm_serve::EngineKind` but
+/// lives here so the `Engine` trait can return it without `dllm-serve` becoming
+/// a dependency of `dllm-core`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EngineFlavor {
+    /// `llama-cpp-2`, CPU-only, `n_gpu_layers = 0`.
+    Llama,
+    /// The C++ `dllm_shim` over llama.cpp + ggml-rpc; may span devices.
+    Shim,
+    /// Canned Phase 0 tokens.
+    Mock,
+}
+
+impl EngineFlavor {
+    /// Wire value used by `GET /api/stats`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Llama => "llama",
+            Self::Shim => "shim",
+            Self::Mock => "mock",
+        }
+    }
+}
+
+impl std::fmt::Display for EngineFlavor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One stage the planner *asked* for. Intent, not measurement.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RequestedStage {
+    /// Position in `PipelinePlan::stages`, which is also ggml slot order.
+    pub stage: usize,
+    pub device_id: String,
+    pub layer_start: u32,
+    pub layer_end: u32,
+    pub layers: u32,
+    /// `host:port` for a remote worker; `None` for this process.
+    pub endpoint: Option<String>,
+}
+
+/// One contiguous run of layers a ggml device **actually** holds, read back out
+/// of `llama_model::dev_layer()` via `dllm_shim_session_report`.
+///
+/// This is the counterpart to [`RequestedStage`], and it is deliberately kept
+/// even when the two agree: a Distribution view that only showed the request
+/// could not tell a working pipeline from a plan nobody applied.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MeasuredStage {
+    pub device_id: String,
+    pub layer_start: u32,
+    pub layer_end: u32,
+    pub layers: u32,
+    /// ggml global device index the layers landed on.
+    pub ggml_device: i32,
+}
+
+/// Everything an engine can honestly say about itself after a generation.
+///
+/// Every field is `Option` for the same reason the API's are: `null` = not
+/// measured. `notes` carries degradations that are true but not numeric — a
+/// dropped stage, an assumed local-device count — so they are reported instead
+/// of disappearing.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct EngineTelemetry {
+    /// Redundant with `EngineFlavor`, so a `measured` blob is self-describing
+    /// when it is copied out of the API response on its own.
+    pub engine: String,
+    /// Catalog name of the loaded model.
+    pub model: String,
+    /// `dllm_shim_abi_version()`, shim engine only.
+    pub shim_abi_version: Option<i32>,
+    /// `ggml_backend_dev_count()` at report time (local + every RPC device).
+    pub devices: Option<i32>,
+    pub n_layer: Option<i32>,
+    pub n_ctx: Option<i32>,
+    /// Layers off the CPU device, as counted from `dev_layer()`.
+    pub n_gpu_layers: Option<i32>,
+    /// The `tensor_split` handed to `dllm_shim_session_open`, verbatim.
+    pub requested_tensor_split: Option<Vec<f32>>,
+    /// The plan this request was derived from, in stage order.
+    pub requested_stages: Vec<RequestedStage>,
+    /// Measured reality from `layer_owner`. `None` when the shim could not read
+    /// it back — never reconstructed from `requested_tensor_split`.
+    pub measured_stages: Option<Vec<MeasuredStage>>,
+    pub prefill_ms: Option<f64>,
+    pub decode_ms: Option<f64>,
+    /// `decode_ms / n_generated`; `None` when nothing was generated.
+    pub decode_ms_per_token: Option<f64>,
+    pub predicted_per_second: Option<f64>,
+    pub n_prompt_tokens: Option<i32>,
+    pub n_generated: Option<i32>,
+    /// `host:port` of every registered RPC worker, in registration order.
+    pub rpc_endpoints: Vec<String>,
+    /// True statements about degradation, in the order they were discovered.
+    pub notes: Vec<String>,
 }
 
 /// Phase 0 mock: streams a canned sentence word-by-word with 30 ms delays.
@@ -48,6 +177,10 @@ impl MockEngine {
 impl Engine for MockEngine {
     fn model_list(&self) -> Vec<String> {
         self.models.clone()
+    }
+
+    fn flavor(&self) -> EngineFlavor {
+        EngineFlavor::Mock
     }
 
     fn generate_stream(&self, _prompt: String) -> mpsc::Receiver<TokenEvent> {
@@ -291,6 +424,17 @@ impl LlamaEngine {
 impl Engine for LlamaEngine {
     fn model_list(&self) -> Vec<String> {
         vec!["qwen3-0.6b-q4".to_string()]
+    }
+
+    fn flavor(&self) -> EngineFlavor {
+        EngineFlavor::Llama
+    }
+
+    /// `None`: `llama-cpp-2` exposes no per-device placement information at
+    /// all (it cannot even reach ggml-rpc), so this engine genuinely has nothing
+    /// measured to report and the API renders an explicit `null`.
+    fn telemetry(&self) -> Option<EngineTelemetry> {
+        None
     }
 
     fn generate_stream(&self, prompt: String) -> mpsc::Receiver<TokenEvent> {

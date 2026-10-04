@@ -4,6 +4,11 @@
 
 | Artifact | Path | Status | Blocker / next |
 |----------|------|--------|----------------|
+| Distributed layers via ggml-rpc (C++ shim) | `native/` (CMake + `dllm_shim.cpp` + `include/dllm_shim.h`) + `crates/dllm-shim` | DONE | **VERIFIED LIVE**: 28 layers split 12/16 across two processes, `graph splits = 2`, 13 tokens @ 16.3 tok/s; requested 11/17 vs measured 12/16 both shown. 15 exports, generated `.def` (PE/COFF ignores `-fvisibility=hidden`). Build: `scripts/build-llama-win.ps1` (llama.cpp b7418, `GGML_RPC=ON`) |
+| Android RPC worker | `build-llama-ndk.ps1` (`GGML_RPC=ON`) + `cpp/dllm_shim_android.cpp` + `LlamaBridge.rpcServeStart/Stop` + `WorkerService` | BUILD-VERIFIED | `libggml-rpc.a` built (23 MB); APK 69.2 MB assembles. Phone can now HOST layers but has NOT yet executed an assigned layer range against a real coordinator (human-gated) |
+| `dllm rpc-worker` | `apps/dllm/src/main.rs` | DONE | hosts this device as a ggml-rpc worker; `--host/--port/--threads`. Blocks (no stop path in ABI, ADR-033) |
+| Supervisor / membership reopen | `apps/dllm/src/main.rs` (`spawn_session_supervisor`) | DONE | re-derives the plan when a worker heartbeats and reopens the session with a new `tensor_split`; verified live `tensor_split=[11,17] stages=2` |
+| Distribution telemetry | `GET /api/stats.distribution` + `GET /v1/plan.measured` | DONE | `layer_owner` from the shim's observed placement, prefill/decode ms, tok/s; honest nulls pre-first-token |
 | Contracts | `contracts/` (8 files) | DONE | reconciled with code 2026-10-04: frame layout = fixed-width LE per `activation-frame.md` + separate `ACK1` namespace, `GET /v1/mesh` + `Mesh`/`MeshPeer` schemas added, `Plan.latency_ms`/`bottleneck` documented nullable-and-always-present, `contracts/README.md` crate paths fixed. Open deltas: `POST /v1/sessions` 200-vs-201 + `POST …/messages` body shape (pre-existing) |
 | Windows svc scaffold | `apps/dllm` + `crates/*` (dllm-core, dllm-net, dllm-store, dllm-serve) | DONE | no longer "uncompiled": `cargo build -p dllm` clean; `dllm.exe` serves HTTP/SSE + web dist, advertises mDNS, binds the 8443 QUIC mesh |
 | `dllm.exe` | `target\x86_64-pc-windows-gnu\debug\dllm.exe` (113 MB) | DONE | E2E smoke passed: health/session/message/SSE token stream/serve dist |

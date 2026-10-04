@@ -20,6 +20,9 @@ dllm-store = { path = "../dllm-store" }
 # `PeerLink` holds a live `quinn::Connection`, so this is no longer test-only.
 dllm-net = { path = "../dllm-net" }
 quinn = { workspace = true }
+# RpcEndpoint parsing for the registry -> shim device-order bridge
+# (pipeline_targets). Runtime-loaded; nothing links at build time (ADR-032).
+dllm-shim = { path = "../dllm-shim" }
 hostname = { workspace = true }
 sysinfo = { workspace = true }
 

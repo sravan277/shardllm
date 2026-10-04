@@ -6,6 +6,14 @@
 apps/web/node_modules/
 apps/web/dist/
 
+# Vendored llama.cpp (cloned by scripts/build-llama-win.ps1, ~50k files).
+# NOT tracked: scripts/build-llama-win.ps1 reproduces it at the pinned tag.
+third_party/
+
+# native/ build output (llama.cpp + ggml-rpc + dllm_shim.dll)
+/native/build-win/
+/native/build-*/
+
 # Android (local SDK path + generated outputs)
 apps/android/.gradle/
 apps/android/build/

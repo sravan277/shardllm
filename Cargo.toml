@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/dllm-core",
     "crates/dllm-net",
+    "crates/dllm-shim",
     "crates/dllm-store",
     "crates/dllm-serve",
     "apps/dllm",

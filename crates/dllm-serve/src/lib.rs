@@ -45,7 +45,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use dllm_core::plan::TOTAL_LAYERS;
-use dllm_core::{DeviceSpec, Engine, PipelinePlan, StageRange, plan_layers};
+use dllm_core::{
+    DeviceSpec, Engine, EngineFlavor, PipelinePlan, PlannedDevice, SessionRequest, StageRange,
+    plan_layers,
+};
 use dllm_store::Store;
 use mesh::MeshState;
 use serde::{Deserialize, Serialize};
@@ -74,6 +77,8 @@ pub struct SseMsg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineKind {
     Llama,
+    /// The C++ `dllm_shim` over llama.cpp + ggml-rpc; may span devices.
+    Shim,
     Mock,
 }
 
@@ -81,19 +86,25 @@ impl EngineKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Llama => "llama",
+            Self::Shim => "shim",
             Self::Mock => "mock",
         }
     }
 
-    /// `Engine` has no downcast hook, so discriminate by the concrete size
-    /// behind the erased `Arc`: `LlamaEngine` is one `Arc<_>` (8 B on
-    /// 64-bit), `MockEngine` a `Vec<String>` (24 B). Falls back to
-    /// [`EngineKind::Mock`] for anything else.
+    /// Ask the engine itself.
+    ///
+    /// This used to be a size sniff (`size_of_val(engine.as_ref())`), which only
+    /// worked while every engine had a distinct size: `ShimEngine` is a single
+    /// `Arc`, exactly like `LlamaEngine`, so the sniff would have labelled a
+    /// distributed session `"llama"` and hidden the very thing this repo exists to
+    /// demonstrate. `Engine::flavor` is the honest answer; `Engine`'s default
+    /// implementation still performs the old heuristic so nothing that predates
+    /// it changes behaviour.
     pub fn from_engine(engine: &Arc<dyn Engine>) -> Self {
-        if std::mem::size_of_val(engine.as_ref()) == std::mem::size_of::<Arc<()>>() {
-            Self::Llama
-        } else {
-            Self::Mock
+        match engine.flavor() {
+            EngineFlavor::Llama => Self::Llama,
+            EngineFlavor::Shim => Self::Shim,
+            EngineFlavor::Mock => Self::Mock,
         }
     }
 }
@@ -127,6 +138,16 @@ pub struct AppState {
     /// [`mesh::spawn_mesh_server`] so `GET /v1/mesh` and `GET /api/stats`
     /// report the real links.
     pub mesh: Arc<MeshState>,
+    /// Why the distributed (shim) engine was **not** used, or `None` when it is
+    /// live / the choice never applied.
+    ///
+    /// A missing optional native artifact, an ABI mismatch or a session that will
+    /// not open all mean `dllm serve` quietly falls back to `LlamaEngine`. That
+    /// fallback has to be visible, not just logged, because "my layers are all on
+    /// one box" is otherwise indistinguishable from "the plan is broken". Set once
+    /// at startup via [`AppState::set_engine_note`]; `None` renders as an explicit
+    /// `null` in `GET /api/stats`.
+    pub engine_note: Mutex<Option<String>>,
 }
 
 /// Stable node identity surfaced via `GET /api/node` (pairing bootstrap).
@@ -292,7 +313,36 @@ pub fn new_state_with_mesh(
         http_port,
         gen_runs: Mutex::new(HashMap::new()),
         mesh,
+        engine_note: Mutex::new(None),
     })
+}
+
+impl AppState {
+    /// Record why the shim engine was not used (or clear the note with `None`).
+    ///
+    /// Separate from the constructors so `dllm serve` can report a startup
+    /// fallback without every `new_state*` signature growing a parameter.
+    pub fn set_engine_note(&self, note: Option<String>) {
+        *self.engine_note.lock().unwrap_or_else(|e| e.into_inner()) = note;
+    }
+
+    /// The recorded engine fallback reason, if any.
+    pub fn engine_note(&self) -> Option<String> {
+        self.engine_note
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Measured engine telemetry for `/v1/plan` and `/api/stats`.
+    ///
+    /// `None` for engines that measure nothing (`MockEngine`, `LlamaEngine`),
+    /// which callers must render as an explicit `null`, never as zeros.
+    pub fn engine_telemetry(&self) -> Option<serde_json::Value> {
+        self.engine
+            .telemetry()
+            .and_then(|t| serde_json::to_value(t).ok())
+    }
 }
 
 /// Max paired members per network (join beyond this is 409 full).
@@ -406,9 +456,17 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let sessions = state.store.count_sessions().unwrap_or(0);
     let events = state.store.count_events().unwrap_or(0);
     let mesh = state.mesh.summary();
+    let telemetry = state.engine_telemetry();
+    // `engine_note` is the honest inverse of `engine`: when the coordinator
+    // wanted distributed inference and could not have it, this says why.
+    let engine_note = state
+        .engine_note()
+        .map(serde_json::Value::String)
+        .unwrap_or(serde_json::Value::Null);
     Json(serde_json::json!({
         "uptime_s": state.started.elapsed().as_secs(),
         "engine": state.engine_kind.as_str(),
+        "engine_note": engine_note,
         "sessions": sessions,
         "events": events,
         "node_id": state.node.node_id,
@@ -416,7 +474,36 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "peers_connected": mesh.peers_connected,
             "allowed_peers": mesh.allowed_peers,
         },
+        // Measured layer placement, straight from
+        // `dllm_shim_session_report`'s `layer_owner`. `null` for engines with no
+        // device placement to report — never zeros, never the requested plan.
+        "distribution": telemetry.as_ref().map(|t| distribution_summary(t)),
     }))
+}
+
+/// Compact `GET /api/stats` → `distribution` view.
+///
+/// Keeps the measured per-device layer runs and the aggregate timing, and drops
+/// the rest of the telemetry blob (which `/v1/plan` carries in full). Every
+/// field is copied verbatim; nothing here is derived or reconciled.
+fn distribution_summary(telemetry: &serde_json::Value) -> serde_json::Value {
+    let pick = |key: &str| telemetry.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "engine": pick("engine"),
+        "model": pick("model"),
+        "shim_abi_version": pick("shim_abi_version"),
+        "devices": pick("devices"),
+        "n_layer": pick("n_layer"),
+        "n_gpu_layers": pick("n_gpu_layers"),
+        "requested_tensor_split": pick("requested_tensor_split"),
+        "requested_stages": pick("requested_stages"),
+        "measured_stages": pick("measured_stages"),
+        "decode_ms": pick("decode_ms"),
+        "decode_ms_per_token": pick("decode_ms_per_token"),
+        "predicted_per_second": pick("predicted_per_second"),
+        "rpc_endpoints": pick("rpc_endpoints"),
+        "notes": pick("notes"),
+    })
 }
 
 async fn models() -> impl IntoResponse {
@@ -632,6 +719,11 @@ struct DeviceView {
     last_seen: String,
     paired_at: String,
     paired_by: String,
+    /// Advertised ggml-rpc `host:port`; `null` when the device never sent one
+    /// (or sent a port with no reachable host). `null` here is load-bearing: it
+    /// is what makes `pipeline_targets` refuse to plan a stage onto the device
+    /// instead of dialling a guessed address.
+    rpc_endpoint: Option<String>,
 }
 
 /// Real registry read: every field from the `devices` table; `active` is
@@ -651,6 +743,7 @@ async fn list_devices(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
             last_seen: r.last_seen,
             paired_at: r.paired_at,
             paired_by: r.paired_by,
+            rpc_endpoint: r.rpc_endpoint.map(|e| e.trim().to_string()).filter(|e| !e.is_empty()),
         })
         .collect();
     devs.sort_by(|a, b| {
@@ -699,6 +792,20 @@ struct HeartbeatReq {
     /// or `[0,8]`); persisted only when sent, never synthesized.
     #[serde(default)]
     layers: Option<serde_json::Value>,
+    /// Port this device's ggml-rpc worker listens on, or `None`.
+    ///
+    /// A worker knows its own port but not which of its interfaces the
+    /// coordinator will reach, so the *port* travels in the heartbeat and the
+    /// *host* is taken from the live QUIC peer's observed remote address
+    /// (see `mesh::MeshState::remote_ip_for`). A worker that does know its LAN
+    /// address should send `rpc_host` too and it wins.
+    #[serde(default)]
+    rpc_port: Option<u16>,
+    /// Host/IP the coordinator should dial, or `None` to use the QUIC peer's
+    /// observed remote IP. Rejected (400) when sent without `rpc_port`, because
+    /// a host with no port is not an endpoint.
+    #[serde(default)]
+    rpc_host: Option<String>,
 }
 
 /// Worker lifeline: upsert (default role `worker`) + `last_seen` = now +
@@ -714,6 +821,17 @@ async fn heartbeat(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "ok": false, "error": "device_id required" })),
+        );
+    }
+    // A host without a port is not an endpoint, and storing the host alone would
+    // let `rpc_endpoint` look populated to a reader while nothing can dial it.
+    if body.rpc_host.is_some() && body.rpc_port.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "rpc_host requires rpc_port",
+            })),
         );
     }
     let role = body.role.unwrap_or_else(|| "worker".to_string());
@@ -759,6 +877,48 @@ async fn heartbeat(
         let _ = state
             .store
             .set_device_layers(&body.device_id, Some(&layers_str));
+    }
+    // Persist the advertised RPC endpoint. Stored only when we actually know a
+    // `host:port`: a peer with a port but no reachable host (no QUIC link yet, or
+    // `rpc_host` omitted and no live peer address) leaves the column NULL, which
+    // reads as "the coordinator cannot dial this device" — exactly right, and
+    // `pipeline_targets` then refuses to plan a stage onto it rather than
+    // inventing 127.0.0.1.
+    if let Some(port) = body.rpc_port {
+        if port == 0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "rpc_port must be 1..=65535" })),
+            );
+        }
+        let host = match body.rpc_host.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+            Some(h) => Some(h.to_string()),
+            None => state
+                .mesh
+                .remote_ip_for(&body.device_id)
+                .map(|ip| ip.to_string()),
+        };
+        match host {
+            Some(h) => {
+                let endpoint = format!("{h}:{port}");
+                let _ = state
+                    .store
+                    .set_device_rpc_endpoint(&body.device_id, Some(&endpoint));
+                tracing::debug!(
+                    device_id = %body.device_id,
+                    %endpoint,
+                    "recorded ggml-rpc endpoint for a paired worker"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    device_id = %body.device_id,
+                    rpc_port = port,
+                    "worker advertised an rpc_port but no host is known (no live QUIC peer \
+                     address); not storing an endpoint, so it will not get a pipeline stage"
+                );
+            }
+        }
     }
     let _ = state.store.touch_last_seen(&body.device_id);
     let _ = state.store.set_status(&body.device_id, "paired");
@@ -1152,13 +1312,156 @@ fn stage_map_for(
     m
 }
 
+/// Pipeline devices the shim can actually place layers on, **in plan order**.
+///
+/// This is the single place the registry's view of "who exists" becomes the
+/// shim's view of "which ggml devices exist", and it is deliberately strict:
+///
+/// - **self** is always stage 0 and is always local. It is what makes the
+///   single-device fast path a special case of the distributed one rather than a
+///   second code path.
+/// - a peer qualifies only when it is **paired** (already enforced by
+///   [`pipeline_candidates`]), **worker_active**, **advertising a parseable
+///   `rpc_endpoint`**, and **not pointing at an endpoint this coordinator already
+///   registered**. Anything else is dropped *with a log line*, because the
+///   contract is "a dead endpoint degrades the stage count and says so", never
+///   "session creation fails".
+/// - duplicates are dropped. `dllm_shim_add_rpc_server` appends to a global
+///   device list and does **not** de-duplicate, so two registry rows pointing at
+///   the same worker would double its device slots and shift every later stage.
+///
+/// Returned `PlannedDevice`s are positionally aligned with `plan.stages` — that
+/// positional alignment *is* the ordering invariant documented in
+/// `dllm_shim::split`, so it must not be broken here (no sorting, no filtering
+/// after the fact).
+pub fn pipeline_targets(
+    candidates: &[dllm_store::DeviceRow],
+    node_id: &str,
+) -> (Vec<PlannedDevice>, Vec<String>) {
+    let mut devices: Vec<PlannedDevice> = Vec::with_capacity(candidates.len());
+    let mut notes: Vec<String> = Vec::new();
+    let mut seen_endpoints: Vec<String> = Vec::new();
+
+    for row in candidates {
+        let is_self = row.device_id == node_id;
+        if is_self {
+            devices.push(PlannedDevice::local(row.device_id.clone()));
+            continue;
+        }
+        // `pipeline_candidates` already gated on `worker_active`; re-checking here
+        // keeps the function correct if it is ever called with raw rows.
+        if !matches!(row.worker_active, Some(1)) {
+            continue;
+        }
+        let Some(raw) = row.rpc_endpoint.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        else {
+            notes.push(format!(
+                "{}: worker_active but never advertised an rpc_endpoint (heartbeat rpc_port + \
+                 rpc_host, or a live QUIC peer address)",
+                row.device_id
+            ));
+            continue;
+        };
+        // Normalised `host:port` is the dedup key: two rows can spell the same
+        // endpoint differently ("pixel-8.lan:50052" vs "192.168.1.9:50052" is
+        // *not* detected here on purpose - only string-identical endpoints are,
+        // because resolving names would require trusting DNS to be the same host).
+        let endpoint = match raw.parse::<dllm_shim::RpcEndpoint>() {
+            Ok(e) => e,
+            Err(e) => {
+                notes.push(format!(
+                    "{}: rpc_endpoint {raw:?} is unusable ({e}); stage dropped",
+                    row.device_id
+                ));
+                continue;
+            }
+        };
+        let key = endpoint.as_endpoint_string();
+        if seen_endpoints.contains(&key) {
+            notes.push(format!(
+                "{}: rpc_endpoint {key} is already claimed by another stage; not registering it \
+                 twice (a double add would duplicate its ggml device slots)",
+                row.device_id
+            ));
+            continue;
+        }
+        seen_endpoints.push(key);
+        devices.push(PlannedDevice::remote(row.device_id.clone(), endpoint));
+    }
+
+    (devices, notes)
+}
+
+/// Build the [`SessionRequest`] for the current membership, or `None` when
+/// there are no weights to load.
+///
+/// Split out of `run_serve` so the plan, the device order and the model path are
+/// built in exactly one place — the supervisor re-runs it whenever membership
+/// changes, and a second copy of that logic would eventually drift and quietly
+/// mis-index `tensor_split`.
+///
+/// `mesh` is currently unused by the target selection itself (the endpoint is
+/// resolved at heartbeat time, where the live peer address is known); it is a
+/// parameter so a future NAT/traversal fallback can consult the live link
+/// without changing the call site.
+pub fn session_request(
+    model_path: std::path::PathBuf,
+    model_name: &str,
+    n_ctx: u32,
+    node_id: &str,
+    store: &Store,
+    _mesh: &MeshState,
+) -> (Option<SessionRequest>, Vec<String>) {
+    let now_ms = unix_ms_now();
+    let all = store.list_devices().unwrap_or_default();
+    let cands = pipeline_candidates(all, node_id, now_ms);
+    let plan = compute_pipeline_plan(&cands, node_id);
+    let (devices, mut notes) = pipeline_targets(&cands, node_id);
+    if devices.is_empty() {
+        // No eligible device at all (self row missing). Honest single-device
+        // fallback on the coordinator id, mirroring `compute_pipeline_plan`.
+        return (
+            Some(SessionRequest::local_only(
+                model_path,
+                model_name.to_string(),
+                n_ctx,
+                node_id.to_string(),
+            )),
+            notes,
+        );
+    }
+    if devices.len() != plan.stages.len() {
+        notes.push(format!(
+            "{} of {} planned stages have no dialable endpoint; the shim will redistribute \
+             their layers",
+            plan.stages.len() - devices.len().min(plan.stages.len()),
+            plan.stages.len()
+        ));
+    }
+    (
+        Some(SessionRequest {
+            model_path,
+            model_name: model_name.to_string(),
+            n_ctx,
+            plan,
+            devices,
+        }),
+        notes,
+    )
+}
+
 /// Serialize one planned stage for `/v1/plan` and `/v1/usage`.
 ///
-/// `latency_ms` is **always explicit `null`**: a per-stage latency is
-/// `compute + one activation hop`, and stage execution is not wired yet
-/// (ADR-028), so any number here would be fabricated. Clients can rely on the
-/// key being present and nullable. `stage` is omitted when the caller does
-/// not want the positional index (`/v1/usage` mirrors the plan without it).
+/// `latency_ms` is **always explicit `null`**: a per-stage latency would be
+/// `compute + one activation hop`, and llama.cpp's perf counters in the shim
+/// build are whole-graph — there is no per-device timer behind the ABI, so any
+/// number here would be fabricated. What *is* measurable (total prefill/decode,
+/// ms per token) is reported once at the top level of `/v1/plan` as
+/// `measured.decode_ms_per_token`; what is measurable *per stage* is the layer
+/// range each device actually holds, which arrives in `measured.measured_stages`.
+/// Clients can rely on the key being present and nullable. `stage` is omitted
+/// when the caller does not want the positional index (`/v1/usage` mirrors the
+/// plan without it).
 fn plan_stage_json(
     stage_index: Option<usize>,
     device_id: &str,
@@ -1171,6 +1474,9 @@ fn plan_stage_json(
     v.insert("device_id".into(), serde_json::json!(device_id));
     v.insert("layer_start".into(), serde_json::json!(range.start));
     v.insert("layer_end".into(), serde_json::json!(range.end));
+    // Derived purely from the requested range, so it is safe to state: the
+    // inclusive length of a contiguous range.
+    v.insert("layers".into(), serde_json::json!(range.len()));
     v.insert("latency_ms".into(), serde_json::Value::Null);
     serde_json::Value::Object(v)
 }
@@ -1255,6 +1561,10 @@ async fn device_detail(
         "capabilities": capabilities,
         "worker_active": worker_active,
         "layers": layers,
+        "rpc_endpoint": row
+            .rpc_endpoint
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty()),
     });
     let load = if is_self {
         match live_load() {
@@ -1530,6 +1840,10 @@ async fn get_plan(
                 "stages": plan_stages_json(&plan, &ids, true),
                 "bottleneck": serde_json::Value::Null,
                 "note": single_device_note(cands.len()),
+                "measured": state.engine_telemetry().map(|mut m| {
+                    annotate_measured_stages(&mut m, &ids);
+                    m
+                }),
             })),
         );
     }
@@ -1546,8 +1860,48 @@ async fn get_plan(
             "stages": plan_stages_json(&plan, &ids, true),
             "bottleneck": serde_json::Value::Null,
             "note": single_device_note(cands.len()),
+            // Measured reality alongside the request. `null` when no engine in
+            // this process measures device placement (mock / llama-cpp-2), which
+            // is "not measured", never "all local".
+            "measured": state.engine_telemetry().map(|mut m| {
+                annotate_measured_stages(&mut m, &ids);
+                m
+            }),
         })),
     )
+}
+
+/// Attach each requested stage's `measured` counterpart, matched by `device_id`.
+///
+/// Both halves stay in the response: `stages[].layer_start/layer_end` is what
+/// the planner asked for and `measured.measured_stages[].layer_start/layer_end`
+/// is what llama.cpp actually did. They routinely differ by one layer (our
+/// weights are exact layer counts, llama.cpp's own rounding decides the split),
+/// and collapsing the two would hide the only interesting fact on the page.
+fn annotate_measured_stages(telemetry: &mut serde_json::Value, device_ids: &[String]) {
+    let Some(measured) = telemetry
+        .get("measured_stages")
+        .and_then(|m| m.as_array())
+        .cloned()
+    else {
+        return;
+    };
+    let by_device: HashMap<&str, &serde_json::Value> = measured
+        .iter()
+        .filter_map(|m| m.get("device_id").and_then(|d| d.as_str()))
+        .zip(measured.iter())
+        .collect();
+    let Some(stages) = telemetry.get_mut("requested_stages").and_then(|s| s.as_array_mut()) else {
+        return;
+    };
+    for stage in stages.iter_mut() {
+        let Some(id) = stage.get("device_id").and_then(|d| d.as_str()) else {
+            continue;
+        };
+        let measured = by_device.get(id).copied().cloned();
+        stage["measured"] = measured.unwrap_or(serde_json::Value::Null);
+    }
+    let _ = device_ids;
 }
 
 /// Informational `note` for `/v1/plan`: at most one candidate means the
@@ -4061,6 +4415,266 @@ mod tests {
         mesh.set_bound_port(9999);
         assert_eq!(shared.mesh.bound_port(), 9999);
         assert_eq!(shared.mesh.endpoint(), "0.0.0.0:9999");
+
+        cleanup(&path);
+    }
+
+    /// A worker heartbeat carrying `rpc_port` + `rpc_host` must land a
+    /// `host:port` the coordinator can actually dial — that string is the only
+    /// thing that lets a peer get a pipeline stage at all.
+    #[tokio::test]
+    async fn heartbeat_rpc_endpoint_roundtrips_through_the_registry() {
+        let path = temp_db("rpc-endpoint");
+        let store = Arc::new(Store::open(&path).expect("open store"));
+        seed_self(&store, "dllm-dev-1");
+        let state = new_state(Arc::new(MockEngine::new()), store.clone());
+        let app = || router(state.clone());
+
+        let res = app()
+            .oneshot(post_json(
+                "/v1/devices/heartbeat",
+                serde_json::json!({
+                    "device_id": "pixel-8",
+                    "worker_active": true,
+                    "rpc_host": "192.168.1.42",
+                    "rpc_port": 50052,
+                }),
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(res.status(), StatusCode::OK);
+
+        assert_eq!(
+            store.get_device_rpc_endpoint("pixel-8").unwrap().as_deref(),
+            Some("192.168.1.42:50052")
+        );
+        let (_, list) = get_json(&app(), "/v1/devices").await;
+        let row = list["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["device_id"] == "pixel-8")
+            .expect("pixel-8 row");
+        assert_eq!(row["rpc_endpoint"], "192.168.1.42:50052");
+
+        cleanup(&path);
+    }
+
+    /// A host without a port is not an endpoint, and storing half of one would
+    /// make `rpc_endpoint` look dialable to any reader.
+    #[tokio::test]
+    async fn heartbeat_rejects_a_host_without_a_port_and_a_zero_port() {
+        let path = temp_db("rpc-bad");
+        let store = Arc::new(Store::open(&path).expect("open store"));
+        seed_self(&store, "dllm-dev-1");
+        let state = new_state(Arc::new(MockEngine::new()), store.clone());
+        let app = || router(state.clone());
+
+        let res = app()
+            .oneshot(post_json(
+                "/v1/devices/heartbeat",
+                serde_json::json!({"device_id": "peer-1", "rpc_host": "10.0.0.5"}),
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(res).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("rpc_port"));
+
+        let res = app()
+            .oneshot(post_json(
+                "/v1/devices/heartbeat",
+                serde_json::json!({"device_id": "peer-1", "rpc_host": "10.0.0.5", "rpc_port": 0}),
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Nothing was invented for the peer.
+        assert_eq!(store.get_device_rpc_endpoint("peer-1").unwrap(), None);
+
+        cleanup(&path);
+    }
+
+    /// `pipeline_targets` is the registry -> shim device-order bridge, and the
+    /// only place the "a dead endpoint degrades, it does not fail" rule lives.
+    /// Pure logic, so it needs no mesh, no store and no DLL.
+    #[test]
+    fn pipeline_targets_keeps_plan_order_and_drops_undialable_stages() {
+        use dllm_store::DeviceRow;
+        let row = |id: &str, worker: Option<i64>, endpoint: Option<&str>| DeviceRow {
+            device_id: id.to_string(),
+            role: if id == "self" { "coordinator".into() } else { "worker".into() },
+            permissions: "[]".into(),
+            cert_fp: "fp".into(),
+            status: "paired".into(),
+            paired_at: "2026-01-01T00:00:00Z".into(),
+            paired_by: String::new(),
+            last_seen: "2026-01-01T00:00:00Z".into(),
+            device_name: None,
+            cpu_pct: None,
+            mem_pct: None,
+            load_updated_at: None,
+            capabilities: None,
+            worker_active: worker,
+            layers: None,
+            rpc_endpoint: endpoint.map(str::to_string),
+        };
+
+        let rows = vec![
+            // Candidates arrive self-first (that is `pipeline_candidates`' sort).
+            row("self", None, None),
+            row("worker-a", Some(1), Some("10.0.0.5:50052")),
+            // worker_active but never advertised where to dial: dropped.
+            row("worker-b", Some(1), None),
+            // Advertised a port but its host is unparseable: dropped, not fatal.
+            row("worker-c", Some(1), Some("not-an-endpoint")),
+            // Not running a worker: never a pipeline candidate in the first place.
+            row("worker-d", Some(0), Some("10.0.0.9:50052")),
+            // Two registry rows, one worker: the second must be dropped, because
+            // `dllm_shim_add_rpc_server` does NOT dedup and a double add would
+            // duplicate that worker's device slots and shift stage 2.
+            row("worker-e", Some(1), Some("10.0.0.5:50052")),
+        ];
+
+        let (devices, notes) = pipeline_targets(&rows, "self");
+        let got: Vec<(&str, Option<String>)> = devices
+            .iter()
+            .map(|d| {
+                (
+                    d.device_id.as_str(),
+                    d.endpoint.as_ref().map(|e| e.as_endpoint_string()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("self", None),
+                ("worker-a", Some("10.0.0.5:50052".to_string())),
+            ],
+            "self is local and first; only dialable worker_active peers survive, in order"
+        );
+        assert_eq!(notes.len(), 3, "every drop is reported: {notes:?}");
+        assert!(notes.iter().any(|n| n.contains("worker-b")));
+        assert!(notes.iter().any(|n| n.contains("worker-c")));
+        assert!(
+            notes.iter().any(|n| n.contains("worker-e") && n.contains("already claimed")),
+            "duplicate endpoint must be reported, not silently skipped: {notes:?}"
+        );
+
+        // Empty membership: no stages, and still no panic.
+        let (devices, notes) = pipeline_targets(&[], "self");
+        assert!(devices.is_empty());
+        assert!(notes.is_empty());
+    }
+
+    /// A plan of N devices must produce an N-entry device list aligned with the
+    /// plan's stages — the ordering invariant `tensor_split` depends on.
+    #[test]
+    fn session_request_devices_align_one_for_one_with_plan_stages() {
+        let path = temp_db("session-req");
+        let store = Store::open(&path).expect("open store");
+        seed_self(&store, "self");
+        store
+            .upsert_device("worker-a", "worker", "[]", "fp-a", "self")
+            .unwrap();
+        store.set_device_worker_active("worker-a", Some(true)).unwrap();
+        store
+            .set_device_rpc_endpoint("worker-a", Some("10.0.0.5:50052"))
+            .unwrap();
+        store.touch_last_seen("self").unwrap();
+        store.touch_last_seen("worker-a").unwrap();
+
+        let mesh = MeshState::new();
+        let (req, notes) = session_request(
+            std::path::PathBuf::from("model.gguf"),
+            "qwen3-0.6b-q4",
+            4096,
+            "self",
+            &store,
+            &mesh,
+        );
+        let req = req.expect("a request");
+        assert_eq!(req.plan.stages.len(), 2);
+        assert_eq!(req.devices.len(), req.plan.stages.len());
+        assert!(req.devices[0].endpoint.is_none(), "self is local");
+        assert_eq!(
+            req.devices[1]
+                .endpoint
+                .as_ref()
+                .map(|e| e.as_endpoint_string())
+                .as_deref(),
+            Some("10.0.0.5:50052")
+        );
+        assert!(notes.is_empty(), "nothing should be dropped here: {notes:?}");
+        // And the weights are the plan's layer counts, one per stage.
+        let ids: Vec<String> = req.devices.iter().map(|d| d.device_id.clone()).collect();
+        let split = dllm_core::tensor_split_for_plan(&req.plan, &ids).expect("split");
+        assert_eq!(split.weights.len(), 2);
+        assert_eq!(
+            split.weights.iter().sum::<f32>(),
+            req.plan.num_layers() as f32
+        );
+
+        cleanup(&path);
+    }
+
+    /// `/api/stats` must carry `engine_note` and `distribution` as explicit
+    /// nulls for an engine that measures nothing, and `MockEngine` must keep
+    /// reporting `"mock"`.
+    #[tokio::test]
+    async fn stats_exposes_engine_note_and_honest_null_distribution() {
+        let path = temp_db("stats-note");
+        let store = Arc::new(Store::open(&path).expect("open store"));
+        let state = new_state(Arc::new(MockEngine::new()), store);
+        assert_eq!(state.engine_note(), None);
+        state.set_engine_note(Some("dllm_shim.dll not found".to_string()));
+        assert_eq!(
+            state.engine_note().as_deref(),
+            Some("dllm_shim.dll not found")
+        );
+
+        let (_, v) = get_json(&router(state.clone()), "/api/stats").await;
+        assert_eq!(v["engine"], "mock");
+        assert_eq!(v["engine_note"], "dllm_shim.dll not found");
+        assert!(
+            v["distribution"].is_null(),
+            "MockEngine measures nothing, so distribution is null, never zeros"
+        );
+
+        state.set_engine_note(None);
+        let (_, v) = get_json(&router(state), "/api/stats").await;
+        assert!(v["engine_note"].is_null());
+
+        cleanup(&path);
+    }
+
+    /// `/v1/plan` must publish `measured` as an explicit `null` when nothing has
+    /// been measured, and per-stage `latency_ms` must stay null regardless —
+    /// the shim's timers are whole-graph, so a per-stage number would be a
+    /// fabrication.
+    #[tokio::test]
+    async fn plan_publishes_measured_null_and_layer_counts_for_a_mock_engine() {
+        let path = temp_db("plan-measured");
+        let store = Arc::new(Store::open(&path).expect("open store"));
+        seed_self(&store, "dllm-dev-1");
+        let app = router(new_state(Arc::new(MockEngine::new()), store));
+
+        let (status, v) = get_json(&app, "/v1/plan").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            v["measured"].is_null(),
+            "no engine measurement -> explicit null, got {}",
+            v["measured"]
+        );
+        let stage = &v["stages"][0];
+        assert_eq!(stage["layers"], TOTAL_LAYERS);
+        assert!(stage["latency_ms"].is_null());
+        assert!(stage["measured"].is_null());
+        assert!(v["bottleneck"].is_null());
 
         cleanup(&path);
     }

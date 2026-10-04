@@ -392,6 +392,29 @@ impl MeshState {
         out
     }
 
+    /// IP address a paired peer's QUIC connection was accepted from, or `None`
+    /// when that peer has no live link.
+    ///
+    /// Why the coordinator needs this: the ggml-rpc protocol is a *separate*
+    /// plaintext TCP server, and a worker on another machine may advertise only
+    /// its RPC **port** (it knows the port it was told to listen on) without
+    /// knowing which of its interfaces the coordinator will reach. The address
+    /// the peer connected *from* is the one the coordinator already proved is
+    /// routable, so it is the honest host for `host:port`.
+    ///
+    /// The port half comes from the registry (`rpc_endpoint`); this only supplies
+    /// the host. Returns `None` rather than a loopback guess — dialing
+    /// `127.0.0.1:<port>` for a remote peer would silently hit the *coordinator's*
+    /// own CPU, which is the single most confusing failure this feature could
+    /// have.
+    pub fn remote_ip_for(&self, device_id: &str) -> Option<std::net::IpAddr> {
+        self.lock()
+            .links
+            .values()
+            .find(|l| l.device_id == device_id)
+            .map(|l| l.remote.ip())
+    }
+
     /// `GET /api/stats` → `mesh` summary.
     pub fn summary(&self) -> MeshSummary {
         let inner = self.lock();

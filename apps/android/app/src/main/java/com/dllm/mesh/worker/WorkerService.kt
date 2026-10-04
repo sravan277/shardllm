@@ -14,6 +14,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.dllm.mesh.data.IdentityStore
+import com.dllm.mesh.net.LanIp
 import com.dllm.mesh.net.Presence
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -44,6 +45,25 @@ data class WorkerStats(
     val lastHeartbeatEpochMs: Long = 0L,
     val ready: Boolean = false,
     val status: String = "Stopped.",
+    /**
+     * ggml-rpc endpoint this phone is hosting, as `host:port` — the exact string
+     * `dllm_shim_add_rpc_server(host_port)` takes. Null whenever the RPC server
+     * is not confirmed listening.
+     *
+     * NEVER synthesised: null means "not hosting", it does not mean "host unknown
+     * but probably fine". A coordinator that reads a made-up endpoint fails at
+     * connect time with a much worse error message than an absent field.
+     */
+    val rpcEndpoint: String? = null,
+    /**
+     * ggml-rpc port, or 0 when not hosting.
+     *
+     * PLACEHOLDER-FREE but also not a measurement: it is the port we bound, and
+     * [rpcEndpoint] is non-null only once a real connect() to that port
+     * succeeded. Kept as a separate field because the coordinator's device row
+     * stores a port next to the host, not a joined string.
+     */
+    val rpcPort: Int = 0,
 )
 
 /**
@@ -81,6 +101,25 @@ class WorkerService : Service() {
         private const val WAKE_TAG = "dllm:shard"
         private const val WIFI_TAG = "dllm:worker"
         private const val HEARTBEAT_MS = 30_000L
+
+        /**
+         * Port the ggml-rpc server binds (ADR-031). Upstream `rpc-server` defaults
+         * to 50052; keeping it means a coordinator can be pointed here by hand
+         * from a log without cross-referencing two halves of the codebase.
+         */
+        const val RPC_PORT = 50052
+
+        /**
+         * Threads the hosted CPU device may use per graph.
+         *
+         * NOT a measurement of this phone's decode throughput — a deliberate cap.
+         * The RPC server computes assigned layers on a native thread via ggml-cpu's
+         * pool; leaving every core to it would starve the JVM and risk the 30s
+         * heartbeat. Same honesty rule as `WorkerCapabilities`' placeholders: the
+         * value here is a ceiling chosen for liveness, and is labelled as such
+         * rather than presented as a calibrated capability.
+         */
+        const val RPC_THREADS = 2
 
         private val _stats = MutableStateFlow(WorkerStats())
         /** Public read-only stats; updated with tokens decoded + last heartbeat. */
@@ -144,6 +183,14 @@ class WorkerService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
+    /**
+     * ggml-rpc protocol version the native server speaks, read from
+     * `LlamaBridge.rpcProtocolVersion()` when hosting started. Empty = unknown,
+     * and the heartbeat then omits `rpc_protocol` rather than guessing it.
+     */
+    @Volatile
+    private var rpcProtocol: String = ""
+
     override fun onCreate() {
         super.onCreate()
         ensureChannel()
@@ -167,6 +214,7 @@ class WorkerService : Service() {
         heartbeatJob?.cancel()
         heartbeatJob = null
         scope.cancel()
+        stopRpcServer("service stopped")
         runCatching { if (LlamaBridge.nativeAvailable) LlamaBridge.free() }
         releaseLocks()
         updateStats { it.copy(running = false, ready = false, status = "Stopped.") }
@@ -184,6 +232,10 @@ class WorkerService : Service() {
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
             probeLocalModel(explicitModelPath)
+            // Host BEFORE the first heartbeat so the very first advertisement
+            // already carries a live endpoint; the reverse order would make the
+            // coordinator learn about this worker one tick before it could reach it.
+            startRpcServer()
             sendWorkerHeartbeat()
             while (true) {
                 delay(HEARTBEAT_MS)
@@ -193,14 +245,115 @@ class WorkerService : Service() {
     }
 
     /**
+     * Start the ggml-rpc server so a coordinator on another device can offload
+     * transformer layers here (ADR-031).
+     *
+     * Runs on [scope]'s dispatcher, never the main thread: the JNI call blocks
+     * until the port is confirmed listening (bounded at ~5s inside native code),
+     * and an ANR is not an acceptable way to open a socket. It does NOT hold a
+     * wake lock of its own — [holdWifiLock] already keeps the interface up for
+     * the whole service, and a second lock would only add battery draw.
+     *
+     * Bind address: the best LAN candidate from [LanIp], NOT loopback (a
+     * coordinator on another device cannot reach 127.0.0.1) and NOT the
+     * single-IP route trick that ADR-026 documents as picking VPN/PPP addresses
+     * on multi-homed hosts. If no candidate looks like a LAN — airplane mode, or
+     * only cellular — we bind [LanIp.ANY_INTERFACE] and still advertise, because
+     * a listener on every interface is strictly more reachable than no listener;
+     * the address we advertise is then the best candidate we have, which the
+     * coordinator may or may not be able to route to.
+     */
+    private suspend fun startRpcServer() {
+        if (!LlamaBridge.nativeAvailable) {
+            Log.w(TAG, "RPC hosting skipped: native lib missing")
+            return
+        }
+        val initRc = runCatching { LlamaBridge.shimInit() }.getOrDefault(-1)
+        if (initRc != 0) {
+            Log.w(TAG, "RPC hosting skipped: shimInit rc=$initRc (${LlamaBridge.shimLastError()})")
+            updateStats { it.copy(rpcEndpoint = null, rpcPort = 0) }
+            return
+        }
+        val candidates = LanIp.candidates()
+        val bindHost = candidates.firstOrNull() ?: LanIp.ANY_INTERFACE
+        val port = RPC_PORT
+        val rc = runCatching { LlamaBridge.rpcServeStart(bindHost, port, RPC_THREADS, -1) }
+            .getOrDefault(-1)
+        if (rc != 0 || !LlamaBridge.rpcServing()) {
+            val why = runCatching { LlamaBridge.shimLastError() }.getOrDefault("unknown")
+            Log.w(TAG, "RPC hosting failed on $bindHost:$port rc=$rc ($why)")
+            updateStats { it.copy(rpcEndpoint = null, rpcPort = 0) }
+            return
+        }
+        // Advertise the address a peer can actually dial. When we bound
+        // 0.0.0.0 the bind address is not a dialable endpoint, so fall back to the
+        // best candidate and, failing that, report nothing rather than a wildcard.
+        val advertised = when {
+            bindHost != LanIp.ANY_INTERFACE -> bindHost
+            else -> candidates.firstOrNull()
+        }
+        if (advertised == null) {
+            Log.w(TAG, "RPC bound to $bindHost:$port but no LAN address to advertise; withdrawing")
+            LlamaBridge.rpcServeStop()
+            updateStats { it.copy(rpcEndpoint = null, rpcPort = 0) }
+            return
+        }
+        val endpoint = "$advertised:$port"
+        val proto = runCatching { LlamaBridge.rpcProtocolVersion() }.getOrDefault("").trim()
+        Log.i(TAG, "RPC hosting layers at $endpoint (bound $bindHost, candidates=$candidates, proto=$proto)")
+        rpcProtocol = proto
+        updateStats {
+            it.copy(
+                rpcEndpoint = endpoint,
+                rpcPort = port,
+                // Report the endpoint where the user can actually see it: stats
+                // (Devices tab) and the ongoing notification.
+                status = "${it.status} Hosting RPC $endpoint.",
+            )
+        }
+        startForegroundWith("DLLM Mesh worker — hosting layers at $endpoint")
+    }
+
+    /**
+     * Withdraw the RPC endpoint. Called on toggle-off (via [stop] -> onDestroy)
+     * and on service teardown.
+     *
+     * Honest scope: llama.cpp b7418 has no RPC-server shutdown hook, so this stops
+     * *advertising* and refuses a restart on the same port for the life of the
+     * process; the listening socket is released when the app process exits. The
+     * endpoint is therefore cleared from stats immediately so no heartbeat can
+     * point a coordinator at a worker we have retired.
+     */
+    private fun stopRpcServer(reason: String) {
+        if (!LlamaBridge.nativeAvailable) return
+        runCatching { LlamaBridge.rpcServeStop() }
+            .onFailure { Log.w(TAG, "rpcServeStop failed: ${it.message}") }
+        runCatching { LlamaBridge.shimFree() }
+            .onFailure { Log.w(TAG, "shimFree failed: ${it.message}") }
+        rpcProtocol = ""
+        updateStats { it.copy(rpcEndpoint = null, rpcPort = 0) }
+        Log.i(TAG, "RPC endpoint withdrawn ($reason)")
+    }
+
+    /**
      * Worker lifeline: role=worker heartbeat with load + capabilities so
      * `/v1/plan` can assign layers. Failures only log — the loop retries on
      * the next tick and the service keeps running.
+     *
+     * The ggml-rpc endpoint rides along in `capabilities` (`rpc_endpoint` =
+     * `host:port`, `rpc_port`) when this phone is hosting, and is absent when it
+     * is not — so a coordinator can tell "this worker will accept layers" from
+     * "this worker only chats".
      */
     private suspend fun sendWorkerHeartbeat() {
         val tick = runCatching {
             val base = IdentityStore(applicationContext).coordinatorUrl.first().trimEnd('/')
-            Presence.postHeartbeat(applicationContext, base)
+            Presence.postHeartbeat(
+                applicationContext,
+                base,
+                _stats.value.rpcEndpoint,
+                rpcProtocol.ifBlank { null },
+            )
         }
         if (tick.isSuccess) {
             updateStats { it.copy(lastHeartbeatEpochMs = System.currentTimeMillis()) }

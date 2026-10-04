@@ -4,6 +4,12 @@
 // libdllm_worker.so (arm64-v8a). Links the static libs built by
 // build-llama-ndk.ps1 (llama/ggml, tag b7418, android-28, CPU-only).
 // Single-threaded use: one mutex guards model lifetime + inference.
+//
+// ADR-025 locks loadModel/inferChunk/free as the stable local-decode ABI. The
+// symbols below are ADDITIVE (ADR-031): they expose the shared dllm_shim C ABI
+// so this phone can HOST ggml-rpc layers for a coordinator on another device.
+// The three original entry points are unchanged, and they deliberately do NOT
+// take g_mu - hosting and local decode are independent lifecycles.
 
 #include <jni.h>
 
@@ -17,11 +23,21 @@
 #include <thread>
 #include <vector>
 
+#include "dllm_shim.h"
+#include "ggml-rpc.h"
 #include "llama.h"
 
 #define DLLM_TAG "dllm_worker"
 #define DLLM_LOGI(...) __android_log_print(ANDROID_LOG_INFO, DLLM_TAG, __VA_ARGS__)
 #define DLLM_LOGW(...) __android_log_print(ANDROID_LOG_WARN, DLLM_TAG, __VA_ARGS__)
+
+// Implemented in dllm_shim_android.cpp, declared here because these three are
+// Android-local additions to dllm_shim.h (see that file for why they are not in
+// the shared header yet, and delete these declarations when it grows the hooks).
+extern "C" int dllm_shim_rpc_serve_start(const char *host, int32_t port, const char *cache_dir,
+                                         int32_t n_threads, int32_t n_devices);
+extern "C" int dllm_shim_rpc_serve_stop(void);
+extern "C" int dllm_shim_rpc_serving(void);
 
 namespace {
 
@@ -258,6 +274,95 @@ Java_com_dllm_mesh_worker_LlamaBridge_free(JNIEnv* /*env*/, jobject /*thiz*/) {
     std::lock_guard<std::mutex> lock(g_mu);
     release_state_locked();
     DLLM_LOGI("free: released");
+}
+
+// ---------------------------------------------------------------------------
+// ADR-031: ggml-rpc hosting surface. Additive to the ADR-025 three above.
+//
+// Every function here is non-blocking. dllm_shim_rpc_serve() blocks forever (the
+// shared ABI is "block until the server stops"), so dllm_shim_rpc_serve_start()
+// runs it on a private C++ thread and returns only once the port is confirmed
+// accepting connections. That keeps the heartbeat coroutine and the main thread
+// free, and means the JNI layer never owns a thread it cannot join.
+//
+// None of these take g_mu: the local-decode mutex must not be held while the RPC
+// server spends minutes computing an assigned layer range, or a chat request
+// would block behind offloaded layers.
+// ---------------------------------------------------------------------------
+
+JNIEXPORT jint JNICALL
+Java_com_dllm_mesh_worker_LlamaBridge_shimInit(JNIEnv* /*env*/, jobject /*thiz*/) {
+    const int rc = dllm_shim_init();
+    DLLM_LOGI("shimInit: rc=%d abi=%d", rc, dllm_shim_abi_version());
+    return rc;
+}
+
+JNIEXPORT void JNICALL
+Java_com_dllm_mesh_worker_LlamaBridge_shimFree(JNIEnv* /*env*/, jobject /*thiz*/) {
+    // Stop hosting first: dllm_shim_free() documents "call once, at shutdown,
+    // after every session is closed", and the serve thread is still a session.
+    dllm_shim_rpc_serve_stop();
+    dllm_shim_free();
+    DLLM_LOGI("shimFree: done");
+}
+
+JNIEXPORT jint JNICALL
+Java_com_dllm_mesh_worker_LlamaBridge_shimAbiVersion(JNIEnv* /*env*/, jobject /*thiz*/) {
+    return dllm_shim_abi_version();
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_dllm_mesh_worker_LlamaBridge_shimLastError(JNIEnv* env, jobject /*thiz*/) {
+    const char* err = dllm_shim_last_error();
+    if (err == nullptr) return utf16_to_jstring(env, u"");
+    return utf16_to_jstring(env, utf8_to_utf16(std::string(err)));
+}
+
+// host must be a literal IPv4 address ("192.168.1.42") or "0.0.0.0"; llama.cpp
+// resolves it with inet_addr() and rejects anything else. nDevices < 0 means
+// "expose every accelerator this device has" (CPU on this build). Returns 0 only
+// once the port is really listening; negative means the endpoint is NOT usable.
+JNIEXPORT jint JNICALL
+Java_com_dllm_mesh_worker_LlamaBridge_rpcServeStart(JNIEnv* env, jobject /*thiz*/,
+                                                    jstring jhost, jint port,
+                                                    jint nThreads, jint nDevices) {
+    const std::string host = jstring_to_utf8(env, jhost);
+    if (host.empty()) {
+        DLLM_LOGW("rpcServeStart: empty host");
+        return -1;
+    }
+    const int rc = dllm_shim_rpc_serve_start(host.c_str(), port, nullptr,
+                                             nThreads, nDevices);
+    if (rc != 0) {
+        DLLM_LOGW("rpcServeStart: %s:%d failed rc=%d (%s)", host.c_str(), port, rc,
+                  dllm_shim_last_error());
+    } else {
+        DLLM_LOGI("rpcServeStart: %s:%d hosting", host.c_str(), port);
+    }
+    return rc;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_dllm_mesh_worker_LlamaBridge_rpcServeStop(JNIEnv* /*env*/, jobject /*thiz*/) {
+    const int rc = dllm_shim_rpc_serve_stop();
+    DLLM_LOGI("rpcServeStop: rc=%d (endpoint withdrawn)", rc);
+    return rc;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_dllm_mesh_worker_LlamaBridge_rpcServing(JNIEnv* /*env*/, jobject /*thiz*/) {
+    return dllm_shim_rpc_serving() != 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+// Read from ggml-rpc.h — the same header libggml-rpc.a was compiled from —
+// rather than a hand-copied string. The pinned tag moves; a stale literal here
+// would tell the coordinator this worker speaks a protocol it does not.
+JNIEXPORT jstring JNICALL
+Java_com_dllm_mesh_worker_LlamaBridge_rpcProtocolVersion(JNIEnv* env, jobject /*thiz*/) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d.%d.%d", RPC_PROTO_MAJOR_VERSION,
+             RPC_PROTO_MINOR_VERSION, RPC_PROTO_PATCH_VERSION);
+    return utf16_to_jstring(env, utf8_to_utf16(std::string(buf)));
 }
 
 }  // extern "C"

@@ -74,6 +74,11 @@ pub struct DeviceRow {
     pub capabilities: Option<String>,
     pub worker_active: Option<i64>,
     pub layers: Option<String>,
+    /// Where this device's ggml-rpc server listens, as `host:port`, or `None`
+    /// when it never advertised one (never synthesized). The coordinator can
+    /// only dial a stage onto a device that has this set, so it is the difference
+    /// between "paired" and "actually reachable for offload".
+    pub rpc_endpoint: Option<String>,
 }
 
 /// One row of the `networks` table (private groups).
@@ -158,7 +163,8 @@ CREATE TABLE IF NOT EXISTS devices (
     load_updated_at TEXT,
     capabilities TEXT,
     worker_active INTEGER,
-    layers TEXT
+    layers TEXT,
+    rpc_endpoint TEXT
 );
 CREATE TABLE IF NOT EXISTS session_titles (
     session    TEXT PRIMARY KEY,
@@ -205,10 +211,10 @@ pub struct Store {
 }
 
 /// Migration for DBs created before `device_name`/`load`/`capabilities`
-/// /`worker_active`/`layers` columns existed: `ALTER TABLE ... ADD COLUMN`
-/// for each missing column. Fresh DBs already have them via `SCHEMA_SQL`
-/// (no-op). Also creates `networks` + `network_members` tables for DBs
-/// created before groups existed (idempotent).
+/// /`worker_active`/`layers`/`rpc_endpoint` columns existed:
+/// `ALTER TABLE ... ADD COLUMN` for each missing column. Fresh DBs already have
+/// them via `SCHEMA_SQL` (no-op). Also creates `networks` +
+/// `network_members` tables for DBs created before groups existed (idempotent).
 fn ensure_device_columns(conn: &rusqlite::Connection) -> Result<(), StoreError> {
     let mut stmt = conn.prepare("PRAGMA table_info(devices)")?;
     let cols: Vec<String> = stmt
@@ -224,6 +230,7 @@ fn ensure_device_columns(conn: &rusqlite::Connection) -> Result<(), StoreError> 
         ("capabilities", "TEXT"),
         ("worker_active", "INTEGER"),
         ("layers", "TEXT"),
+        ("rpc_endpoint", "TEXT"),
     ] {
         if !has(col) {
             conn.execute_batch(&format!("ALTER TABLE devices ADD COLUMN {col} {ddl};"))?;
@@ -514,7 +521,7 @@ impl Store {
             "SELECT device_id, role, permissions, cert_fp,
                     status, paired_at, paired_by, last_seen,
                     device_name, cpu_pct, mem_pct, load_updated_at, capabilities,
-                    worker_active, layers
+                    worker_active, layers, rpc_endpoint
               FROM devices ORDER BY device_id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -534,6 +541,7 @@ impl Store {
                 capabilities: row.get(12)?,
                 worker_active: row.get(13)?,
                 layers: row.get(14)?,
+                rpc_endpoint: row.get(15)?,
             })
         })?;
         let mut out = Vec::new();
@@ -552,7 +560,7 @@ impl Store {
             "SELECT device_id, role, permissions, cert_fp,
                     status, paired_at, paired_by, last_seen,
                     device_name, cpu_pct, mem_pct, load_updated_at, capabilities,
-                    worker_active, layers
+                    worker_active, layers, rpc_endpoint
               FROM devices WHERE device_id = ?1",
         )?;
         let mut rows = stmt.query_map(rusqlite::params![device_id], |row| {
@@ -572,6 +580,7 @@ impl Store {
                 capabilities: row.get(12)?,
                 worker_active: row.get(13)?,
                 layers: row.get(14)?,
+                rpc_endpoint: row.get(15)?,
             })
         })?;
         match rows.next() {
@@ -666,6 +675,39 @@ impl Store {
             rusqlite::params![layers_json, device_id],
         )?;
         Ok(n > 0)
+    }
+
+    /// Store the device's advertised ggml-rpc endpoint (`None` clears to NULL =
+    /// "this device has not told us where to dial it").
+    ///
+    /// Stored as a single `host:port` string rather than separate host/port
+    /// columns because that is exactly what
+    /// `dllm_shim_add_rpc_server` takes, and because a half-known endpoint (a
+    /// port with no reachable host) is not something the coordinator can act on
+    /// — the mesh can fill in the host from the live QUIC peer's observed remote
+    /// address, and that fallback is decided in `dllm-serve`, not here.
+    ///
+    /// Returns `true` when the row existed. Only overwrite when sent.
+    ///
+    /// Blocking: call via `spawn_blocking`.
+    pub fn set_device_rpc_endpoint(
+        &self,
+        device_id: &str,
+        endpoint: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let n = conn.execute(
+            "UPDATE devices SET rpc_endpoint = ?1 WHERE device_id = ?2",
+            rusqlite::params![endpoint, device_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The advertised ggml-rpc endpoint for one device (`None` = unknown).
+    ///
+    /// Blocking: call via `spawn_blocking`.
+    pub fn get_device_rpc_endpoint(&self, device_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self.get_device(device_id)?.and_then(|r| r.rpc_endpoint))
     }
 
     // -----------------------------------------------------------------------

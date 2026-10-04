@@ -1,8 +1,8 @@
-//! `dllm` CLI: serve / list / pull / run / ps (Phase 1: real pull).
+/// `dllm` CLI: serve / list / pull / run / ps / rpc-worker (Phase 1: real pull).
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use sha2::{Digest, Sha256};
@@ -10,6 +10,20 @@ use sha2::{Digest, Sha256};
 /// Baked catalog (same file served by `GET /api/models`).
 /// Requires `contracts/catalog.json` at compile time (contracts mate owns it).
 const CATALOG_JSON: &str = include_str!("../../../contracts/catalog.json");
+
+/// Context window for the served model. Matches `LlamaEngine`'s floor of 512 and
+/// the catalog's 4K default.
+const SERVE_CTX: u32 = 4096;
+
+/// How often the supervisor re-derives the pipeline plan and, if the device
+/// membership changed, reopens the distributed session.
+///
+/// A worker pairs *after* the coordinator has already loaded its model, so the
+/// session cannot be opened once at startup and forgotten: something has to
+/// notice that stage 1 now exists. 5 s is frequent enough that "I paired my
+/// phone and nothing happened" is not a symptom, and rare enough that the
+/// registry read (which is a blocking SQLite call) is not a busy loop.
+const SUPERVISOR_INTERVAL_SECS: u64 = 5;
 
 #[derive(Debug, Parser)]
 #[command(name = "dllm", version, about = "Distributed LAN LLM coordinator CLI (Phase 0)")]
@@ -46,6 +60,23 @@ enum Commands {
         #[arg(long, default_value_t = 8080)]
         port: u16,
     },
+    /// Host a ggml-rpc worker so another coordinator can offload layers here.
+    ///
+    /// Runs on the *worker* machine, not the coordinator: it exposes this
+    /// device's ggml backends over the plaintext RPC protocol and blocks
+    /// forever, because `dllm_shim_rpc_serve` has no stop path in the ABI
+    /// (ADR-032). Stop it with Ctrl-C.
+    RpcWorker {
+        /// Interface to bind (the coordinator must be able to reach it).
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+        /// TCP port for the ggml-rpc protocol.
+        #[arg(long, default_value_t = dllm_shim::DEFAULT_RPC_PORT)]
+        port: u16,
+        /// Compute threads for the RPC backend.
+        #[arg(long, default_value_t = 4)]
+        threads: i32,
+    },
 }
 
 #[tokio::main]
@@ -71,7 +102,49 @@ async fn main() -> anyhow::Result<()> {
             cmd_id(port)?;
             Ok(())
         }
+        Commands::RpcWorker {
+            host,
+            port,
+            threads,
+        } => cmd_rpc_worker(&host, port, threads),
     }
+}
+
+/// `dllm rpc-worker`: expose this device's ggml backends to a coordinator.
+///
+/// Deliberately its own subcommand and its own process. The ABI has no way to
+/// stop `dllm_shim_rpc_serve` (it blocks until the server dies), so calling it
+/// from the coordinator would either wedge the HTTP server or force an
+/// arbitrary `exit()` that skips the graceful shutdown. A worker being a separate
+/// process is also what a real deployment looks like: the coordinator and the
+/// worker are different machines.
+///
+/// The ggml-rpc protocol is plaintext TCP with **no authentication**, exactly as
+/// upstream llama.cpp warns ("Never expose the RPC server to an open network!").
+/// Bind to a LAN interface, never to a public one.
+fn cmd_rpc_worker(host: &str, port: u16, threads: i32) -> anyhow::Result<()> {
+    let lib = match dllm_shim::load_shim().lib() {
+        Some(lib) => lib.clone(),
+        None => anyhow::bail!(
+            "cannot start a ggml-rpc worker without the shim: {}
+\
+             Build it with scripts/build-llama-win.ps1, or set DLLM_SHIM_DLL.",
+            dllm_shim::load_shim().reason().unwrap_or("unknown reason")
+        ),
+    };
+    tracing::info!(
+        shim = %lib.path().display(),
+        abi = lib.abi_version(),
+        %host,
+        port,
+        threads,
+        "serving ggml-rpc; WARNING: this protocol is plaintext TCP with no authentication, \
+         so bind it to a trusted LAN only"
+    );
+    // Blocks forever. `n_devices = -1` exposes every accelerator and falls back
+    // to the CPU device, which is what a CPU-only worker wants.
+    dllm_core::ShimEngine::serve_rpc(lib.as_ref(), host, port, threads)
+        .map_err(|e| anyhow::anyhow!("ggml-rpc worker stopped: {e}"))
 }
 
 async fn run_serve(port: u16) -> anyhow::Result<()> {
@@ -104,24 +177,6 @@ async fn run_serve(port: u16) -> anyhow::Result<()> {
         let _ = store.touch_last_seen(&node_id);
         let _ = store.set_status(&node_id, "paired");
     }
-    // Prefer real inference when weights are present; the server must never
-    // fail to start for lack of weights, so fall back to MockEngine.
-    let engine: Arc<dyn dllm_core::Engine> = match qwen_q4_path() {
-        Some(path) => match dllm_core::LlamaEngine::load(&path, 4096) {
-            Ok(llama) => {
-                tracing::info!(path = %path.display(), "serving with LlamaEngine");
-                Arc::new(llama)
-            }
-            Err(e) => {
-                tracing::warn!("{e:#}; falling back to MockEngine");
-                Arc::new(dllm_core::MockEngine::new())
-            }
-        },
-        None => {
-            tracing::warn!("qwen3-0.6b-q4 not in catalog; serving with MockEngine");
-            Arc::new(dllm_core::MockEngine::new())
-        }
-    };
     // Bind the real mTLS QUIC mesh BEFORE axum::serve: the advertised
     // quic_port must be a live socket, and /v1/mesh must report real links.
     // A bind failure is logged and swallowed on purpose — single-device chat
@@ -147,8 +202,91 @@ async fn run_serve(port: u16) -> anyhow::Result<()> {
         );
     }
 
+    // Engine selection, in order of capability, with every downgrade logged and
+    // reported on `GET /api/stats`:
+    //
+    //   1. `ShimEngine`  — real distributed inference over the C++ shim. This is
+    //      the only engine that can put layers on another device.
+    //   2. `LlamaEngine` — real CPU inference via llama-cpp-2, single-device.
+    //   3. `MockEngine`  — canned tokens.
+    //
+    // The shim is loaded at *runtime* (ADR-032), so on a machine that has never
+    // run `scripts/build-llama-win.ps1` step 1 is a plain `Result::Err` and the
+    // server still boots. That is a hard product requirement, not a nicety: the
+    // HTTP API must never depend on a compiled native artifact.
+    let (engine, engine_note, supervisor_source): (
+        Arc<dyn dllm_core::Engine>,
+        Option<String>,
+        Option<(Arc<dllm_core::ShimEngine>, SupervisorSource)>,
+    ) = match qwen_q4_path() {
+        Some(path) => match try_shim_engine(&path, &node_id, &store, &mesh) {
+            Ok((shim_engine, notes)) => {
+                tracing::info!(
+                    path = %path.display(),
+                    stages = notes.len(),
+                    "serving with ShimEngine (llama.cpp + ggml-rpc; layers can span devices)"
+                );
+                for note in &notes {
+                    tracing::info!(%note, "pipeline stage note");
+                }
+                let source = SupervisorSource {
+                    model_path: path.clone(),
+                    model_name: "qwen3-0.6b-q4".to_string(),
+                    node_id: node_id.clone(),
+                };
+                (
+                    Arc::new(shim_engine.clone()),
+                    None,
+                    Some((Arc::new(shim_engine), source)),
+                )
+            }
+            Err(e) => {
+                // Honest, specific, and visible in the API — a coordinator
+                // quietly running single-device while the user believes their
+                // phone has a stage is the failure this log line exists to stop.
+                let note = format!("{e:#}");
+                tracing::warn!(
+                    "distributed inference unavailable ({note}); falling back to LlamaEngine \
+                     (all layers stay on this machine)"
+                );
+                match dllm_core::LlamaEngine::load(&path, SERVE_CTX) {
+                    Ok(llama) => {
+                        tracing::info!(path = %path.display(), "serving with LlamaEngine");
+                        (Arc::new(llama), Some(note), None)
+                    }
+                    Err(e2) => {
+                        tracing::warn!("{e2:#}; falling back to MockEngine");
+                        (
+                            Arc::new(dllm_core::MockEngine::new()),
+                            Some(format!("{note}; LlamaEngine also failed: {e2:#}")),
+                            None,
+                        )
+                    }
+                }
+            }
+        },
+        None => {
+            tracing::warn!("qwen3-0.6b-q4 not in catalog; serving with MockEngine");
+            (
+                Arc::new(dllm_core::MockEngine::new()),
+                Some("qwen3-0.6b-q4 weights are not installed".to_string()),
+                None,
+            )
+        }
+    };
+
     // Share the same MeshState with the API so GET /v1/mesh + /api/stats see it.
-    let state = dllm_serve::new_state_with_mesh(engine, store.clone(), node, port, mesh);
+    let state = dllm_serve::new_state_with_mesh(engine, store.clone(), node, port, mesh.clone());
+    // Make the fallback reason readable over HTTP, not just in the log. A
+    // coordinator that is secretly single-device must be able to say so.
+    state.set_engine_note(engine_note);
+
+    // Keep the distributed session in step with the membership: a worker pairs
+    // *after* startup, so the session opened above is single-device until the
+    // supervisor notices and reopens it with the new stage.
+    if let Some((shim, source)) = supervisor_source {
+        spawn_session_supervisor(shim, store.clone(), mesh.clone(), source);
+    }
     dllm_serve::spawn_maintenance(store, dllm_serve::DEFAULT_EVENT_TTL_SECS);
     let app = dllm_serve::router(state);
 
@@ -181,6 +319,128 @@ async fn run_serve(port: u16) -> anyhow::Result<()> {
         })
         .await?;
     Ok(())
+}
+
+/// Everything the supervisor needs to re-derive a [`SessionRequest`] on a tick.
+///
+/// Deliberately small and owned (no `Arc<Store>`): the supervisor re-reads the
+/// registry from scratch each tick so it cannot observe a stale cached plan, and
+/// the registry is a local SQLite file.
+#[derive(Debug, Clone)]
+struct SupervisorSource {
+    model_path: PathBuf,
+    model_name: String,
+    node_id: String,
+}
+
+/// Build a [`dllm_core::ShimEngine`] for the current membership.
+///
+/// Returns `(engine, stage_notes)`. `Err` is the "why are we single-device"
+/// answer that becomes both the log line and `GET /api/stats` -> `engine_note`.
+///
+/// Every failure mode here is non-fatal to the process by construction:
+/// - no DLL / wrong ABI -> [`dllm_shim::LoadError`];
+/// - weights missing -> `session_request` still returns a single-stage request,
+///   and `ShimSession::open` fails with an actionable message;
+/// - a dead worker -> dropped as a stage, reported in `stage_notes`.
+fn try_shim_engine(
+    model_path: &PathBuf,
+    node_id: &str,
+    store: &dllm_store::Store,
+    mesh: &dllm_serve::mesh::MeshState,
+) -> Result<(dllm_core::ShimEngine, Vec<String>), anyhow::Error> {
+    // `load_shim` memoises per process: a missing DLL is probed once, so the
+    // warning appears once instead of once per request.
+    let lib = match dllm_shim::load_shim().lib() {
+        Some(lib) => lib.clone(),
+        None => anyhow::bail!(
+            "the native shim is unavailable: {}",
+            dllm_shim::load_shim().reason().unwrap_or("unknown reason")
+        ),
+    };
+    let (request, notes) = dllm_serve::session_request(
+        model_path.clone(),
+        "qwen3-0.6b-q4",
+        SERVE_CTX,
+        node_id,
+        store,
+        mesh,
+    );
+    let Some(request) = request else {
+        anyhow::bail!("no pipeline session request could be built")
+    };
+
+    let devices = request.devices.len();
+    let engine = dllm_core::ShimEngine::open(lib, request)?;
+    if devices <= 1 {
+        // Not a failure: it is the ADR-004 single-device fast path, and it is
+        // reached *through* the same code that will later span devices.
+        tracing::info!(
+            devices,
+            "shim session opened with a single stage; layers will be placed again if a paired \
+             worker advertises an RPC endpoint"
+        );
+    }
+    Ok((engine, notes))
+}
+
+/// Spawn the session supervisor.
+///
+/// The `Engine` trait deliberately has no downcast hook (it is a two-method
+/// trait), so the supervisor is handed the concrete `Arc<ShimEngine>` alongside
+/// the erased `Arc<dyn Engine>` the API uses. `ShimEngine` is one `Arc` inside,
+/// so keeping both costs nothing and needs no `Any` cast.
+fn spawn_session_supervisor(
+    engine: Arc<dllm_core::ShimEngine>,
+    store: Arc<dllm_store::Store>,
+    mesh: Arc<dllm_serve::mesh::MeshState>,
+    source: SupervisorSource,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(Duration::from_secs(SUPERVISOR_INTERVAL_SECS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            // The registry read is blocking SQLite; keep it off the reactor.
+            let (store, mesh, source) = (store.clone(), mesh.clone(), source.clone());
+            let derived = tokio::task::spawn_blocking(move || {
+                dllm_serve::session_request(
+                    source.model_path,
+                    &source.model_name,
+                    SERVE_CTX,
+                    &source.node_id,
+                    &store,
+                    &mesh,
+                )
+            })
+            .await;
+            let (request, notes) = match derived {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!("pipeline supervisor task failed: {e}");
+                    continue;
+                }
+            };
+            for note in &notes {
+                tracing::debug!(%note, "pipeline supervisor note");
+            }
+            let Some(request) = request else {
+                continue;
+            };
+            // Idempotent: `ensure_session` reloads the 400 MB model only when the
+            // derived `tensor_split` or the device order actually changed.
+            let engine = engine.clone();
+            let reopened = tokio::task::spawn_blocking(move || engine.ensure_session(&request))
+                .await;
+            match reopened {
+                Ok(Ok(true)) => tracing::info!("pipeline membership changed; session reopened"),
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => tracing::warn!("could not reopen the distributed session: {e:#}"),
+                Err(e) => tracing::warn!("session reopen task failed: {e}"),
+            }
+        }
+    })
 }
 
 fn parse_catalog() -> serde_json::Value {

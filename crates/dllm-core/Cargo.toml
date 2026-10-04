@@ -5,6 +5,11 @@ edition = "2021"
 
 [dependencies]
 dllm-net = { path = "../dllm-net" }
+# Runtime-loaded FFI to the C++ llama.cpp + ggml-rpc shim. Never linked at build
+# time: `native/build-win/dllm_shim.dll` is optional and gitignored, so
+# `dllm-core` (and therefore `dllm.exe`) must build and its tests must pass
+# without it (ADR-032).
+dllm-shim = { path = "../dllm-shim" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -12,3 +17,9 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 llama-cpp-2 = { workspace = true }
+
+[dev-dependencies]
+# The end-to-end drill (examples/shim_rpc_e2e.rs) initialises a tracing
+# subscriber so a failed generation reports *why* instead of silently printing
+# nothing.
+tracing-subscriber = { workspace = true }

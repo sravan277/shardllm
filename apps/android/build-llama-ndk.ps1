@@ -12,6 +12,7 @@
   Pinned: llama.cpp tag b7418 (verified release, ggml-org/llama.cpp, Dec 2025;
   satisfies the "b7416+" requirement), NDK r26d (26.3.11579264),
   ANDROID_ABI=arm64-v8a, ANDROID_PLATFORM=android-28, no OpenMP/CUDA/Vulkan.
+  GGML_RPC=ON (required — see the configure args below).
 
   Layout:
     app/src/main/cpp/third_party/llama.cpp/                 <- clone (not committed)
@@ -27,6 +28,18 @@
   Phase 5 link step: set DLLM_WITH_LLAMA=ON in
   app/src/main/cpp/CMakeLists.txt and point LLAMA_ANDROID_DIR at
   third_party/llama.cpp/build-android-arm64.
+
+  GGML_RPC=ON is MANDATORY (ADR-031). The whole point of this build is that the
+  phone can HOST transformer layers for a coordinator on another device, which
+  means running a ggml-rpc server here. Without GGML_RPC:
+    - ggml/src/ggml-rpc/ is not added by ggml/CMakeLists.txt at all,
+    - libggml-rpc.a is never produced,
+    - ggml_backend_rpc_start_server() does not exist,
+    - and libggml-base.a is compiled WITHOUT -DGGML_USE_RPC, so the RPC backend
+      is never registered in ggml_backend_registry either.
+  The failure mode is silent: the app still links, still loads a model, still
+  answers inferChunk — it just cannot host a single layer. So the option is set
+  explicitly below AND the .a is verified after the build.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\build-llama-ndk.ps1
@@ -131,6 +144,12 @@ $ConfigArgs = @(
     "-DGGML_OPENMP=OFF",
     "-DGGML_VULKAN=OFF",
     "-DGGML_CUDA=OFF",
+    # MANDATORY for the phone to host layers (see .DESCRIPTION). The vendored
+    # tree does contain ggml/src/ggml-rpc/, but GGML_RPC defaults to OFF, so
+    # without this flag there is no libggml-rpc.a and no
+    # ggml_backend_rpc_start_server to call. This also compiles libggml-base.a
+    # with -DGGML_USE_RPC so ggml_backend_registry registers the RPC backend.
+    "-DGGML_RPC=ON",
     "-S", $SrcDir,
     "-B", $BuildDir
 )
@@ -146,6 +165,28 @@ if (-not $?) { throw "cmake configure failed." }
 Write-Host "Building static libs (this takes a while on first run)..."
 & $CmakeExe --build $BuildDir --config Release
 if (-not $?) { throw "cmake build failed." }
+
+# ---- verify GGML_RPC actually produced a library ----------------------------
+# WHY this is a hard failure and not a warning: a build where GGML_RPC silently
+# stayed OFF still produces a full, working-looking set of lib*.a files, so every
+# later step (link, JNI, RPC server) succeeds while the phone can host nothing.
+# The symptom would only appear at runtime as "the RPC endpoint never comes up",
+# hours later. Assert the artifact here instead.
+$RpcLib = Join-Path $BuildDir "ggml\src\ggml-rpc\libggml-rpc.a"
+if (-not (Test-Path -LiteralPath $RpcLib)) {
+    throw ("GGML_RPC=ON was requested but libggml-rpc.a was not produced at: " +
+        $RpcLib + "`nThe phone cannot host transformer layers without it " +
+        "(ggml_backend_rpc_start_server lives there). Check that the vendored " +
+        "tree still has ggml/src/ggml-rpc/ggml-rpc.cpp.")
+}
+$RpcLen = (Get-Item -LiteralPath $RpcLib).Length
+Write-Host ("OK: libggml-rpc.a present ({0:N0} bytes)" -f $RpcLen)
+
+# The header must exist too — worker.cpp cannot even compile without it.
+$RpcHdr = Join-Path $SrcDir "ggml\include\ggml-rpc.h"
+if (-not (Test-Path -LiteralPath $RpcHdr)) {
+    throw "ggml-rpc.h missing at $RpcHdr - cannot compile the RPC server host."
+}
 
 Write-Host "--- Outputs ($BuildDir) ---"
 Get-ChildItem -LiteralPath $BuildDir -Recurse -Filter "*.a" | Select-Object FullName, @{n="MB";e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize

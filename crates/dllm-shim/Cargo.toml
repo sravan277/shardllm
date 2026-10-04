@@ -1,0 +1,20 @@
+[package]
+name = "dllm-shim"
+version = "0.1.0"
+edition = "2021"
+description = "Runtime-loaded FFI boundary to the C++ dllm_shim (llama.cpp + ggml-rpc)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+# Runtime DLL loading. This crate has NO link-time dependency on the native
+# artifact: `native/build-win/dllm_shim.dll` is gitignored and may simply not
+# exist on a machine that has never run `scripts/build-llama-win.ps1`, and the
+# coordinator must still boot and serve HTTP when it is missing (ADR-032).
+# `libloading` was already in `Cargo.lock` (0.8.9, pulled in by clang-sys ->
+# bindgen -> llama-cpp-sys-2), so promoting it to a direct dependency adds no
+# new crate to the graph and no new download; see docs/DECISIONS.md ADR-032.
+libloading = "0.8"

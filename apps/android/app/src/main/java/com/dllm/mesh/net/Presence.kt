@@ -38,13 +38,25 @@ object Presence {
      * Announce this phone to a coordinator registry (upserts the paired row).
      * Throws on transport/HTTP error; callers translate with
      * [friendlyCause].
+     *
+     * @param rpcEndpoint `host:port` of the ggml-rpc server this phone is hosting
+     *   for offloaded transformer layers (ADR-031), or null when it is hosting
+     *   none. Null means "cannot host", which the coordinator must be able to see:
+     *   the field is then absent from `capabilities`, never an empty string.
+     * @param rpcProtocol ggml-rpc protocol version the native server speaks, from
+     *   `LlamaBridge.rpcProtocolVersion()`. Omitted when unknown.
      */
-    suspend fun postHeartbeat(appContext: Context, base: String) {
+    suspend fun postHeartbeat(
+        appContext: Context,
+        base: String,
+        rpcEndpoint: String? = null,
+        rpcProtocol: String? = null,
+    ) {
         val store = IdentityStore(appContext)
         val id = store.ensureNodeId()
         val workerOn = store.workerEnabled.first()
         val (cpu, mem) = DeviceLoad.sample(appContext)
-        val caps = if (workerOn) WorkerCapabilities.build() else null
+        val caps = if (workerOn) WorkerCapabilities.build(rpcEndpoint, rpcProtocol) else null
         val layers = if (workerOn) WorkerCapabilities.offeredLayers() else null
         val body = IdentityStore.buildHeartbeatBody(
             deviceId = id,
@@ -139,13 +151,34 @@ object DeviceLoad {
  *   per-layer head count and the memory actually left after Android's own
  *   overhead; neither is readable from here without loading the model. Kept as a
  *   conservative fixed value.
+ *
+ * `rpc_endpoint` is different again, and is a *fact* rather than an estimate
+ * (ADR-031): it is present only when a native connect() to that ggml-rpc port
+ * succeeded, and its value is exactly the `host:port` string the coordinator
+ * passes to `dllm_shim_add_rpc_server`. `rpc_port` is the same fact split for
+ * registries that store host and port in separate columns, and `rpc_protocol` is
+ * read from the vendored `ggml-rpc.h` at build time. All three are omitted — not
+ * null, not blank — when this phone is not hosting, so "cannot host layers" is a
+ * fact the planner can act on rather than a guess.
+ *
+ * `rpc_protocol` exists so a coordinator never confuses this endpoint with the
+ * mesh activation-frame protocol (ADR-029): this is llama.cpp's own plaintext
+ * ggml-rpc, and it must not be handed to the mesh client.
  */
 object WorkerCapabilities {
 
-    fun build(): JSONObject = JSONObject()
-        .put("ms_per_layer_decode", MS_PER_LAYER_DECODE_PLACEHOLDER)
-        .put("kv_pages", KV_PAGES_PLACEHOLDER)
-        .put("layers", ModelTopology.TOTAL_LAYERS)
+    fun build(rpcEndpoint: String? = null, rpcProtocol: String? = null): JSONObject {
+        val caps = JSONObject()
+            .put("ms_per_layer_decode", MS_PER_LAYER_DECODE_PLACEHOLDER)
+            .put("kv_pages", KV_PAGES_PLACEHOLDER)
+            .put("layers", ModelTopology.TOTAL_LAYERS)
+        if (!rpcEndpoint.isNullOrBlank()) {
+            caps.put("rpc_endpoint", rpcEndpoint)
+            caps.put("rpc_port", rpcEndpoint.substringAfterLast(':', "").toIntOrNull() ?: 0)
+            if (!rpcProtocol.isNullOrBlank()) caps.put("rpc_protocol", rpcProtocol)
+        }
+        return caps
+    }
 
     /** Layer range this worker offers today: the full single-device span. */
     fun offeredLayers(): List<Int> = ModelTopology.allLayers()
