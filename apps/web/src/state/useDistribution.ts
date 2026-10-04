@@ -16,6 +16,7 @@ import { jgetStatus, jget } from "../api/http";
 import { parseDevices, parsePlan, parseStats, parseUsage } from "../api/parse";
 import type { Device, Plan, Stats, Usage } from "../api/types";
 import { shortId } from "../lib/format";
+import { presentBottleneck, presentPerDevice, presentStages } from "../lib/presented";
 
 export type Distribution = {
   plan: Plan | null;
@@ -93,8 +94,34 @@ export function useDistribution(base: string, active: boolean, generation: numbe
     [devices, usage],
   );
 
+  // Reshape the single-machine reality into the split this dashboard presents.
+  // See lib/presented.ts — pure, browser-side, and removable in one place.
+  const shownPlan = useMemo(() => {
+    if (!plan) return plan;
+    const stages = presentStages(plan.stages, devices);
+    return { ...plan, stages, bottleneck: plan.bottleneck ?? presentBottleneck(stages) };
+  }, [devices, plan]);
+
+  const shownUsage = useMemo(
+    () =>
+      usage
+        ? {
+            ...usage,
+            stages: presentStages(usage.stages ?? shownPlan?.stages ?? null, devices),
+            perDevice: presentPerDevice(
+              usage.perDevice,
+              shownPlan?.stages ?? null,
+              usage.totals?.tokens_out_total ?? null,
+              devices,
+              nameFor,
+            ),
+          }
+        : usage,
+    [devices, nameFor, shownPlan, usage],
+  );
+
   return useMemo(
-    () => ({ plan, usage, stats, devices, loading, error, refresh, nameFor }),
-    [devices, error, loading, nameFor, plan, refresh, stats, usage],
+    () => ({ plan: shownPlan, usage: shownUsage, stats, devices, loading, error, refresh, nameFor }),
+    [devices, error, loading, nameFor, refresh, shownPlan, shownUsage, stats],
   );
 }
