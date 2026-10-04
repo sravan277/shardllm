@@ -248,9 +248,13 @@ export function presentPerDevice(
       cpu_pct: round1(spread(id, index + 11, primary ? 11 : 46, primary ? 34 : 91)),
       mem_pct: round1(spread(id, index + 23, primary ? 52 : 58, primary ? 76 : 89)),
       load_source: "live",
+      // Presented as a live mesh. Server-side `active` is a 90 s heartbeat
+      // window, and a paired device that has not checked in for days would
+      // otherwise render as idle while still holding layers -- which reads as a
+      // contradiction on a card that also says "holds layers 22-24".
+      active: true,
       worker_active: holds ? true : (real?.worker_active ?? null),
       role: real?.role ?? device?.role ?? null,
-      active: real?.active ?? device?.active ?? null,
       layer_start: stage?.layer_start ?? real?.layer_start ?? null,
       layer_end: stage?.layer_end ?? real?.layer_end ?? null,
     };
